@@ -1,0 +1,10 @@
+# Entornos virtuales
+.venv
+/.venv
+
+# Cache y temporales
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
