@@ -4,14 +4,12 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Optional
 from pathlib import Path
 
+
 class DCTrader:
-    def __init__(self, ticker: str):
+    def __init__(self, ticker: str, thresholds: Optional[List[float]] = None):
         self.ticker = ticker.upper()
         self.data = None
-        self.thresholds = [
-            0.00098, 0.0022, 0.0048, 0.0072, 0.0098,
-            0.0122, 0.0155, 0.0170, 0.0200, 0.0255
-        ]
+        self.thresholds = thresholds or []
         self.dc_events = {}
         self.data_path = Path(__file__).parent.parent / "data" / f"{self.ticker}.csv"
 
@@ -19,98 +17,124 @@ class DCTrader:
         if not self.data_path.exists():
             raise FileNotFoundError(f"Archivo no encontrado: {self.data_path}")
 
-        # Leer CSV sin skiprows (más robusto)
-        df = pd.read_csv(self.data_path)
+        df = pd.read_csv(self.data_path, parse_dates=['Date'])
 
-        # Forzar nombres de columnas si hay basura
-        if df.iloc[0, 0] == 'Price' or df.iloc[0, 1] == 'Date':
-            df = df.iloc[2:]  # Saltar las 2 primeras filas basura
-            df.columns = ['Index', 'Date', 'Close', 'High', 'Low', 'Open', 'Volume']
-            df = df.drop(columns=['Index'])
-
-        # Limpiar: eliminar filas donde 'Close' no es número
-        df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-        df = df.dropna(subset=['Close'])
-
-        # Convertir Date
-        df['Date'] = pd.to_datetime(df['Date']).dt.date
-
-        # Filtrar por rango
+        # Filtrar rango de fechas
         if start_date:
-            df = df[df['Date'] >= pd.to_datetime(start_date).date()]
+            df = df[df['Date'] >= pd.to_datetime(start_date)]
         if end_date:
-            df = df[df['Date'] < pd.to_datetime(end_date).date()]
+            df = df[df['Date'] < pd.to_datetime(end_date)]
 
         if df.empty:
-            raise ValueError("No hay datos válidos")
+            raise ValueError("No hay datos en el rango de fechas.")
 
         df = df[['Date', 'Close']].sort_values('Date').reset_index(drop=True)
         self.data = df
 
-        print(f"{self.ticker}: {len(df)} días cargados | {df['Date'].iloc[0]} → {df['Date'].iloc[-1]}")
-        self._compute_all_dc_events()
-
-    def _compute_all_dc_events(self):
-        for theta in self.thresholds:
-            self.dc_events[theta] = self._compute_dc_events(theta)
+        print(f"{self.ticker}: {len(df)} días cargados | {df['Date'].iloc[0].date()} → {df['Date'].iloc[-1].date()}")
 
     def _compute_dc_events(self, theta: float) -> List[Dict]:
-        prices = self.data['Close'].values.astype(float)  # ← CLAVE: forzar float
-        dates = self.data['Date'].values
+        if self.data is None:
+            raise ValueError("Primero carga los datos con .load_data()")
+
+        prices = self.data['Close'].values.astype(float)
+        dates = self.data['Date'].dt.to_pydatetime()  # Convertir a datetime.datetime para .days
+
         events = []
+
         mode = 'downtrend'
-        p_ext = prices[0]
-        t_ext = dates[0]
+        p_ext_low = prices[0]
+        p_ext_high = prices[0]
+        t_ext_low = dates[0]
+        t_ext_high = dates[0]
+        t_dc_start = dates[0]
 
         for i in range(1, len(prices)):
-            p = prices[i]
+            p_t = prices[i]
             t = dates[i]
 
             if mode == 'downtrend':
-                if p >= p_ext * (1 + theta):
+                if p_t >= p_ext_low * (1 + theta):
+                    return_dc = (p_t / p_ext_low) - 1
+
                     events.append({
-                        'direction': 'down_to_up',
-                        't_ext': t_ext, 'p_ext': p_ext,
-                        't_dcc': t,     'p_dcc': p
+                        'event_type': mode,
+                        'theta': theta,
+                        'p_ext_low': p_ext_low,
+                        't_ext_low': t_ext_low,
+                        'p_ext_high': p_ext_high,
+                        't_ext_high': t_ext_high,
+                        'p_dcc': p_t,
+                        't_dcc': t,
+                        'return_dc': return_dc,
+                        'duration_days': (t - t_dc_start).days,  # Ahora funciona con datetime
                     })
+
                     mode = 'uptrend'
-                    p_ext = p
-                    t_ext = t
-                elif p < p_ext:
-                    p_ext = p
-                    t_ext = t
-            else:
-                if p <= p_ext * (1 - theta):
+                    p_ext_high = p_t
+                    t_ext_high = t
+                    t_dc_start = t
+                else:
+                    if p_t < p_ext_low:
+                        p_ext_low = p_t
+                        t_ext_low = t
+
+            else:  # uptrend
+                if p_t <= p_ext_high * (1 - theta):
+                    return_dc = (p_t / p_ext_high) - 1
+
                     events.append({
-                        'direction': 'up_to_down',
-                        't_ext': t_ext, 'p_ext': p_ext,
-                        't_dcc': t,     'p_dcc': p
+                        'event_type': mode,
+                        'theta': theta,
+                        'p_ext_low': p_ext_low,
+                        't_ext_low': t_ext_low,
+                        'p_ext_high': p_ext_high,
+                        't_ext_high': t_ext_high,
+                        'p_dcc': p_t,
+                        't_dcc': t,
+                        'return_dc': return_dc,
+                        'duration_days': (t - t_dc_start).days,
                     })
+
                     mode = 'downtrend'
-                    p_ext = p
-                    t_ext = t
-                elif p > p_ext:
-                    p_ext = p
-                    t_ext = t
+                    p_ext_low = p_t
+                    t_ext_low = t
+                    t_dc_start = t
+                else:
+                    if p_t > p_ext_high:
+                        p_ext_high = p_t
+                        t_ext_high = t
+
         return events
 
     def plot_dc(self, theta: float = 0.0122):
         if self.data is None:
             raise ValueError("Ejecuta .load_data() primero")
 
-        fig, ax = plt.subplots(figsize=(16, 8))
-        ax.plot(self.data['Date'], self.data['Close'], color='gray', alpha=0.7, linewidth=0.9, label='Precio')
+        if theta not in self.dc_events:
+            self.dc_events[theta] = self._compute_dc_events(theta)
 
         events = self.dc_events[theta]
 
-        for e in events:
-            marker = '^' if e['direction'] == 'down_to_up' else 'v'
-            color = 'green' if e['direction'] == 'down_to_up' else 'red'
-            ax.scatter(e['t_dcc'], e['p_dcc'], color=color, s=130, marker=marker, edgecolors='black', zorder=6)
-            ax.scatter(e['t_ext'], e['p_ext'], color='black', s=60, marker='o', zorder=5)
+        fig, ax = plt.subplots(figsize=(18, 9))
+        ax.plot(self.data['Date'], self.data['Close'], color='gray', alpha=0.8, linewidth=1.2, label='Close Price', zorder=3)
 
-        ax.set_title(f'{self.ticker} - Directional Changes (θ = {theta:.4%})', fontsize=18)
-        ax.legend(['Precio', 'DC (↓→↑)', 'DC (↑→↓)', 'OS'], loc='upper left')
+        for e in events:
+            if e['event_type'] == 'downtrend':
+                color = 'green'
+                marker = '^'
+            else:
+                color = 'red'
+                marker = 'v'
+
+            # DCC
+            ax.scatter(e['t_dcc'], e['p_dcc'], color=color, s=180, marker=marker, edgecolors='black', linewidth=1.2, zorder=6)
+
+        ax.set_title(f'{self.ticker} - Directional Changes (θ = {theta:.2%})', fontsize=20)
+        ax.set_ylabel('Precio')
+        ax.set_xlabel('Fecha')
+        ax.legend(['Close Price', 'DCC Uptrend', 'DCC Downtrend'], loc='upper left')
         ax.grid(True, alpha=0.3)
+        fig.autofmt_xdate()
         plt.tight_layout()
         plt.show()
