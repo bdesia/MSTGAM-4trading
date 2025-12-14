@@ -183,7 +183,7 @@ class GATrainer(Trainer):
         self.best_fitness = best_individual.fitness.values[0]
         self._assign_weights(best_individual)
 
-        # Backtest final del mejor (para confirmar métricas puras)
+        # Backtest final del mejor
         final_results = self.trader.backtest(weights=self.trader.weights)
 
         print("\n" + "="*60)
@@ -195,16 +195,17 @@ class GATrainer(Trainer):
         print(f"Turnover Rate final         : {final_results['ToR']:.5f}")
         print("="*60)
 
+
 class PSOTrainer(Trainer):
     """
     Entrenador basado en Particle Swarm Optimization (PSO).
     """
     def __init__(self, trader: Any,
-                 swarm_size: int = 80,
-                 n_gen: int = 100,
+                 swarm_size: int = 100,
+                 n_gen: int = 120,
                  w: float = 0.729,     # Inercia
-                 c1: float = 1.494,    # Componente cognitivo
-                 c2: float = 1.494):   # Componente social
+                 c1: float = 1.494,    # Cognitivo
+                 c2: float = 1.494):   # Social
         super().__init__(trader, swarm_size, n_gen)
         self.w = w
         self.c1 = c1
@@ -223,14 +224,22 @@ class PSOTrainer(Trainer):
         try:
             results = self.trader.backtest(weights=weights)
             sr = results['SR']
-            penalty = 0.1 * results['ToR']          # Penaliza la cantidad de trades
-            fitness = sr - penalty
-            if np.isnan(fitness) or np.isinf(fitness):
-                fitness = -10.0
-        except Exception:
-            fitness = -10.0
+            ror = results['RoR']
+            tor = results['ToR']
+            trades = results['trades']
 
-        return fitness
+            if trades < 10 or results['STD'] <= 1e-8:
+                fitness = -10.0
+            else:
+                fitness = sr
+                turnover_penalty = 0.8 * max(0, tor - 0.002)
+                fitness -= turnover_penalty
+                if ror > 0:
+                    fitness += 0.1 * min(ror, 1.0)
+
+            return fitness
+        except Exception:
+            return -20.0
 
     def train(self) -> None:
         self._validate_trader()
@@ -239,11 +248,11 @@ class PSOTrainer(Trainer):
         print(f"Iniciando entrenamiento PSO | Enjambre: {self.pop_size} | Iteraciones: {self.n_gen}")
         print(f"Dimensión del espacio de búsqueda: {dim}")
 
-        # Inicialización de partículas y velocidades
+        # Inicialización
         swarm = [np.random.uniform(0.0, 1.0, dim) for _ in range(self.pop_size)]
         velocities = [np.random.uniform(-1.0, 1.0, dim) for _ in range(self.pop_size)]
 
-        p_best = swarm.copy()  # Mejor posición personal
+        p_best = swarm.copy()
         p_best_fitness = [self._evaluate(p) for p in p_best]
 
         g_best_idx = np.argmax(p_best_fitness)
@@ -256,33 +265,47 @@ class PSOTrainer(Trainer):
             for i in range(self.pop_size):
                 r1, r2 = random.random(), random.random()
 
-                # Actualizar velocidad
-                cognitive = self.c1 * r1 * (p_best[i] - swarm[i])
-                social = self.c2 * r2 * (g_best - swarm[i])
-                velocities[i] = self.w * velocities[i] + cognitive + social
+                # Actualización de velocidad y posición
+                cognitive = self.c1 * r1 * (np.array(p_best[i]) - np.array(swarm[i]))
+                social = self.c2 * r2 * (np.array(g_best) - np.array(swarm[i]))
+                velocities[i] = self.w * np.array(velocities[i]) + cognitive + social
 
-                # Actualizar posición
-                swarm[i] = swarm[i] + velocities[i]
+                swarm[i] = np.array(swarm[i]) + velocities[i]
                 swarm[i] = np.clip(swarm[i], 0.0, 1.0)
 
-                # Evaluar
+                # Evaluación
                 fitness = self._evaluate(swarm[i])
 
-                # Actualizar p_best
+                # Actualización p_best
                 if fitness > p_best_fitness[i]:
                     p_best[i] = swarm[i].copy()
                     p_best_fitness[i] = fitness
 
-                    # Actualizar g_best
+                    # Actualización g_best
                     if fitness > g_best_fitness:
                         g_best = swarm[i].copy()
                         g_best_fitness = fitness
-                        self.best_fitness = fitness
+                        self.best_fitness = fitness  # Actualizamos en caliente
 
-            if gen % 10 == 0 or gen == 1:
-                print(f"  Iteración {gen:3d} | Mejor fitness global: {g_best_fitness:.4f}")
+            # === Reporte de progreso ===
+            if gen % 10 == 0 or gen == 0 or gen == self.n_gen - 1:
+                self._assign_weights(g_best)
+                results = self.trader.backtest(weights=self.trader.weights)
 
-        # Asignar mejor solución
+                print(f"Gen {gen+1:3d} | SR: {results['SR']:.3f} | RoR: {results['RoR']:.3f} | "
+                      f"ToR: {results['ToR']:.5f} | Trades: {results['trades']:3d} | Fit: {g_best_fitness:.3f}")
+
+        # === Finalización ===
+        self.best_fitness = g_best_fitness
         self._assign_weights(g_best)
-        print("\nEntrenamiento PSO completado.")
-        print(f"Mejor fitness encontrado: {g_best_fitness:.4f}")
+
+        final_results = self.trader.backtest(weights=self.trader.weights)
+
+        print("\n" + "="*60)
+        print("ENTRENAMIENTO PSO COMPLETADO EXITOSAMENTE")
+        print(f"Mejor fitness (Sharpe ajustado): {self.best_fitness:.4f}")
+        print(f"Sharpe Ratio puro final     : {final_results['SR']:.4f}")
+        print(f"RoR acumulado final         : {final_results['RoR']:.3f}")
+        print(f"Trades totales              : {final_results['trades']}")
+        print(f"Turnover Rate final         : {final_results['ToR']:.5f}")
+        print("="*60)
