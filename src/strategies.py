@@ -48,7 +48,7 @@ class St4(StrategyBase):
         theta = state.theta
         p_ext_initial = state.p_ext_initial
         tmv_cur = abs((p_current - p_ext_initial) / (theta * p_ext_initial))
-        tmv_best = state.osv_best
+        tmv_best = state.tmv_best
         return tmv_cur >= tmv_best
 
 # St5
