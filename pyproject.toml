@@ -16,6 +16,7 @@ scipy = ">=1.16.1,<2.0.0"
 yfinance = ">=0.2.65,<0.3.0"
 deap = "^1.4.3"
 investpy = "^1.0.8"
+seaborn = "^0.13.2"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.31.0"

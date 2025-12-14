@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional, Union
 from trainer import GATrainer
 from strategies import StrategyBase
 
+from typing import List, Union, Dict, Any, Tuple, Optional
 
 def compute_simple_sr(theta, candidate, prices, value_type='osv', trend_type='dt', operation_cost = 0.0025):
     """
@@ -79,9 +80,7 @@ class StockDataLoader:
         print(f"{self.ticker}: {len(df)} loaded days | {df['Date'].iloc[0].date()} to {df['Date'].iloc[-1].date()}")
 
 
-import pandas as pd
-from typing import List
-import numpy as np  # Para float64 si lo necesitas
+
 
 class DCTracker:
     """
@@ -628,13 +627,72 @@ class DCTrader:
         tor = trades / len(self.prices) if len(self.prices) > 0 else 0
 
         return {'RoR': ror, 'STD': std_r, 'SR': sr, 'VaR': var, 'ToR': tor, 'returns': returns, 'trades': trades}
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from typing import List, Union, Dict, Any, Tuple
-
-
+    
+    def backtest3(self, weights=None) -> Dict[str, Any]:
+        """
+        Backtest que registra la evolución del cumulative return con fecha correspondiente.
+        Mantiene la lógica de trading del backtest original (señales 0=hold, 1=buy, 2=sell).
+        """
+        if weights is None:
+            weights = self.weights
+        if weights is None:
+            raise ValueError("Weights not set; run fit or load_model first")
+        
+        # Inicialización
+        self.position = False          # ¿Hay posición abierta?
+        buy_price = 0.0                # Precio de entrada (con coste de compra)
+        equity = 1.0                   # Capital inicial normalizado a 1 (retorno compuesto)
+        cumulative = []                # Lista para guardar (date, cumulative_return)
+        
+        # Índices de fechas (asumiendo self.prices es pd.Series con index datetime)
+        if isinstance(self.prices, pd.Series):
+            dates = self.prices.index
+        else:
+            dates = range(len(self.prices))  # fallback si es list/array
+        
+        # Recorrido por cada punto temporal
+        for t_current, p_current in enumerate(self.prices):
+            action = self.predict(t_current, p_current, weights)
+            
+            # Ejecutar venta si hay señal de sell y posición abierta
+            if action == 2 and self.position:
+                sell_price = p_current * self.sell_cost_factor
+                ret = (sell_price - buy_price) / buy_price
+                equity *= (1 + ret)        # Aplicar retorno al capital compuesto
+                self.position = False
+            
+            # Ejecutar compra si hay señal de buy y no hay posición
+            if action == 1 and not self.position:
+                buy_price = p_current * self.buy_cost_factor
+                self.position = True
+            
+            # Guardar el cumulative return AL FINAL del período actual
+            current_date = dates[t_current] if hasattr(dates, '__getitem__') else t_current
+            cumulative.append((current_date, equity - 1))  # RoR acumulado hasta este punto
+        
+        # Cerrar posición abierta al final del backtest (último precio)
+        if self.position:
+            sell_price = self.prices.iloc[-1] * self.sell_cost_factor
+            ret = (sell_price - buy_price) / buy_price
+            equity *= (1 + ret)
+            # Actualizamos el último registro con el cierre final
+            cumulative[-1] = (cumulative[-1][0], equity - 1)
+        
+        # Convertir a DataFrame para mayor comodidad
+        cum_df = pd.DataFrame(cumulative, columns=['date', 'cumulative_return'])
+        cum_df.set_index('date', inplace=True)
+        
+        # Métricas adicionales (compatibles con el backtest original)
+        final_ror = equity - 1
+        trades = self.backtest(weights)['trades'] if hasattr(self, 'backtest') else None  # opcional
+        
+        return {
+            'final_RoR': final_ror,
+            'cumulative_series': cum_df,          # Serie temporal principal (pd.DataFrame)
+            'equity_curve': cum_df['cumulative_return'] + 1,  # Equity normalizada (útil para plots)
+            'trades': trades
+        }
+    
 class Backtest:
     def __init__(self, trader: DCTrader):
         self.trader = trader
