@@ -83,12 +83,20 @@ class GATrainer(Trainer):
         try:
             results = self.trader.backtest(weights=weights)
             sr = results['SR']
-            penalty = 0.1 * results['ToR']
-            fitness = sr - penalty
-            if np.isnan(fitness) or np.isinf(fitness):
+            ror = results['RoR']
+            tor = results['ToR']
+            trades = results['trades']
+            if trades < 10 or results['STD'] <= 1e-8:
                 fitness = -10.0
-        except Exception:
-            fitness = -10.0
+            else:
+                fitness = sr
+                turnover_penalty = 0.8 * max(0, tor - 0.002)
+                fitness -= turnover_penalty
+                if ror > 0:
+                    fitness += 0.1 * min(ror, 1.0)
+            return (fitness,)
+        except Exception as e:
+            fitness = -20.0
 
         return (fitness,)
 
@@ -96,8 +104,15 @@ class GATrainer(Trainer):
         self._validate_trader()
 
         total_weights = len(self.trader.combination_matrix)
-        print(f"Iniciando entrenamiento GA | Poblacion: {self.pop_size} | Generaciones: {self.n_gen}")
-        print(f"Numero total de pesos a optimizar: {total_weights}")
+        print(f"Iniciando entrenamiento GA | Población: {self.pop_size} | Generaciones: {self.n_gen}")
+        print(f"Número total de pesos a optimizar: {total_weights}")
+
+        # Limpieza segura de creators previos (evita errores en re-runs)
+        try:
+            del creator.FitnessMax
+            del creator.Individual
+        except AttributeError:
+            pass
 
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
         creator.create("Individual", list, fitness=creator.FitnessMax)
@@ -105,7 +120,7 @@ class GATrainer(Trainer):
         toolbox = base.Toolbox()
         toolbox.register("attr_float", random.uniform, 0.0, 1.0)
         toolbox.register("individual", tools.initRepeat, creator.Individual,
-                         toolbox.attr_float, n=total_weights)
+                        toolbox.attr_float, n=total_weights)
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
         toolbox.register("mate", tools.cxBlend, alpha=0.5)
@@ -114,22 +129,26 @@ class GATrainer(Trainer):
         toolbox.register("evaluate", self._evaluate)
 
         pop = toolbox.population(n=self.pop_size)
-        hof = tools.HallOfFame(1)
+        hof = tools.HallOfFame(1)  # Podés subir a 5 si querés top-5
 
+        # Evaluación inicial
         fitnesses = toolbox.map(toolbox.evaluate, pop)
         for ind, fit in zip(pop, fitnesses):
             ind.fitness.values = fit
 
         for gen in range(1, self.n_gen + 1):
+            # Selección
             offspring = toolbox.select(pop, len(pop))
             offspring = list(map(toolbox.clone, offspring))
 
+            # Crossover
             for child1, child2 in zip(offspring[::2], offspring[1::2]):
                 if random.random() < self.cxpb:
                     toolbox.mate(child1, child2)
                     del child1.fitness.values
                     del child2.fitness.values
 
+            # Mutación
             for mutant in offspring:
                 if random.random() < self.mutpb:
                     toolbox.mutate(mutant)
@@ -137,26 +156,44 @@ class GATrainer(Trainer):
                         mutant[i] = np.clip(mutant[i], 0.0, 1.0)
                     del mutant.fitness.values
 
+            # Re-evaluación de individuos inválidos
             invalid_ind = [ind for ind in offspring if not ind.fitness.valid]
             fitnesses = toolbox.map(toolbox.evaluate, invalid_ind)
             for ind, fit in zip(invalid_ind, fitnesses):
                 ind.fitness.values = fit
 
+            # Reemplazo de población
             pop[:] = offspring
             hof.update(pop)
 
-            if gen % 10 == 0 or gen == 1:
+            # === Reporte breve de progreso ===
+            if gen % 10 == 0 or gen == 1 or gen == self.n_gen:
                 best = hof[0]
-                best_fit = self._evaluate(best)[0]
-                print(f"  Generacion {gen:3d} | Mejor fitness: {best_fit:.4f}")
+                current_fitness = best.fitness.values[0]
 
+                # Backtest completo solo para métricas detalladas
+                self._assign_weights(best)
+                results = self.trader.backtest(weights=self.trader.weights)
+
+                print(f"Gen {gen:3d} | SR: {results['SR']:.3f} | RoR: {results['RoR']:.3f} | "
+                    f"ToR: {results['ToR']:.5f} | Trades: {results['trades']:3d} | Fit: {current_fitness:.3f}")
+
+        # === Finalización ===
         best_individual = hof[0]
-        self.best_fitness = self._evaluate(best_individual)[0]
+        self.best_fitness = best_individual.fitness.values[0]
         self._assign_weights(best_individual)
 
-        print("\nEntrenamiento GA completado.")
-        print(f"Mejor fitness encontrado: {self.best_fitness:.4f}")
+        # Backtest final del mejor (para confirmar métricas puras)
+        final_results = self.trader.backtest(weights=self.trader.weights)
 
+        print("\n" + "="*60)
+        print("ENTRENAMIENTO GA COMPLETADO EXITOSAMENTE")
+        print(f"Mejor fitness (Sharpe ajustado): {self.best_fitness:.4f}")
+        print(f"Sharpe Ratio puro final     : {final_results['SR']:.4f}")
+        print(f"RoR acumulado final         : {final_results['RoR']:.3f}")
+        print(f"Trades totales              : {final_results['trades']}")
+        print(f"Turnover Rate final         : {final_results['ToR']:.5f}")
+        print("="*60)
 
 class PSOTrainer(Trainer):
     """
@@ -174,7 +211,7 @@ class PSOTrainer(Trainer):
         self.c2 = c2
 
     def _evaluate(self, particle: List[float]) -> float:
-        """Función de fitness (devuelve valor escalar)."""
+        """Función de fitness"""
         weights = np.zeros((self.trader.n_strats, self.trader.n_ths))
         for (s_idx, th_idx), val in zip(self.trader.combination_matrix, particle):
             weights[s_idx, th_idx] = val
@@ -186,7 +223,7 @@ class PSOTrainer(Trainer):
         try:
             results = self.trader.backtest(weights=weights)
             sr = results['SR']
-            penalty = 0.1 * results['ToR']
+            penalty = 0.1 * results['ToR']          # Penaliza la cantidad de trades
             fitness = sr - penalty
             if np.isnan(fitness) or np.isinf(fitness):
                 fitness = -10.0

@@ -21,7 +21,7 @@ def compute_simple_sr(theta, candidate, prices, value_type='osv', trend_type='dt
                Devuelve 0 si no hay operaciones o la std es cero.
     """
 
-    tracker = DCTracker(theta, t0=0, p0=prices.iloc[0])
+    tracker = DCTracker(theta)
     returns = []
     position = False
     buy_price = 0
@@ -79,6 +79,10 @@ class StockDataLoader:
         print(f"{self.ticker}: {len(df)} loaded days | {df['Date'].iloc[0].date()} to {df['Date'].iloc[-1].date()}")
 
 
+import pandas as pd
+from typing import List
+import numpy as np  # Para float64 si lo necesitas
+
 class DCTracker:
     """
         Tracks Directional Changes (DC)
@@ -91,24 +95,22 @@ class DCTracker:
             for t, p in data:
                 tracker.update(t, p)
         """
-    def __init__(self, theta: float, t0: int, p0: float, memory: int = 5):
+    def __init__(self, theta: float, memory: int = 5):
         """
         Init with theta, initial price p0, time t0
         """
         self.theta = theta
-        self.trend = 'downtrend'
-        self.p_ext = p0
-        self.t_ext = t0
-        self.p_dcc_star = p0 * (1 + theta) if self.trend == 'downtrend' else p0 * (1 - theta)
-        self.p_ext_initial = p0
-        self.t_dcc = t0
+        self.trend = None  # None hasta primer precio
+        self.p_ext = None
+        self.t_ext = None
+        self.p_dcc_star = None
+        self.p_ext_initial = None
+        self.t_dcc = None
         self.dc_duration = 0
         self.is_dcc = False
-        self.trend_history: List[str] = []
-        self.if_os: List[bool] = []
         self.os_length = 0
 
-        # Statistics
+        # Estadísticas
         self.osv_list_dt: List[float] = []
         self.osv_list_ut: List[float] = []
         self.tmv_list_dt: List[float] = []
@@ -118,46 +120,75 @@ class DCTracker:
         self.n_os = 0
         self.n_dc = 0
 
-        self.memory = memory     # save n last for history
+        self.trend_history: List[str] = []
+        self.if_os: List[bool] = []
+        self.memory = memory
+
+        # Estadísticas
+        self.osv_list_dt: List[float] = []
+        self.osv_list_ut: List[float] = []
+        self.tmv_list_dt: List[float] = []
+        self.tmv_list_ut: List[float] = []
+        self.total_t_os = 0
+        self.total_t_dc = 0
+        self.n_os = 0
+        self.n_dc = 0
+
+        self.trend_history: List[str] = []
+        self.if_os: List[bool] = []
+        self.memory = memory
 
     def update(self, t_current: int, p_current: float):
         """
         Process new time/price; detect DC, update stats.
         """
+        if self.trend is None:  # Primer precio → inicializar
+            self.trend = 'downtrend'
+            self.p_ext = p_current
+            self.t_ext = t_current
+            self.p_dcc_star = p_current * (1 + self.theta)
+            self.p_ext_initial = p_current
+            self.t_dcc = t_current
+            self.is_dcc = False
+            return
+
         self.is_dcc = False
-        self.os_length += 1
 
         if self.trend == 'downtrend':
-            if p_current < self.p_ext:
+            if p_current < self.p_ext:  # Actualiza low → OS phase
                 self.p_ext = p_current
                 self.t_ext = t_current
+                self.os_length += 1
             if p_current >= self.p_ext * (1 + self.theta):
                 self._confirm_dc(t_current, p_current, 'uptrend')
+
         else:  # uptrend
-            if p_current > self.p_ext:
+            if p_current > self.p_ext:  # Actualiza high → OS phase
                 self.p_ext = p_current
                 self.t_ext = t_current
+                self.os_length += 1
             if p_current <= self.p_ext * (1 - self.theta):
                 self._confirm_dc(t_current, p_current, 'downtrend')
 
-        # Keep only last for history
-        nlast = self.memory
-        if len(self.trend_history) > nlast:
-            self.trend_history = self.trend_history[-nlast:]
-            self.if_os = self.if_os[-nlast:]
+        # Trim history
+        if len(self.trend_history) > self.memory:
+            self.trend_history = self.trend_history[-self.memory:]
+            self.if_os = self.if_os[-self.memory:]
 
     def _confirm_dc(self, t_current: int, p_current: float, new_trend: str):
         self.is_dcc = True
-        dc_duration_new = t_current - self.t_ext
-        os_length_new = self.t_ext - self.t_dcc
+
+        dc_duration_new = max(0, t_current - self.t_ext)
+        os_length_new = max(0, self.t_ext - self.t_dcc)
 
         self.total_t_dc += dc_duration_new
         self.total_t_os += os_length_new
         self.n_dc += 1
         self.n_os += 1 if os_length_new > 0 else 0
 
-        osv = abs((p_current - self.p_dcc_star) / (self.theta * self.p_dcc_star))
-        tmv = abs((p_current - self.p_ext_initial) / (self.theta * self.p_ext_initial))
+        # OSV y TMV
+        osv = abs(p_current - self.p_dcc_star) / (self.theta * self.p_dcc_star) if self.p_dcc_star != 0 else 0.0
+        tmv = abs(p_current - self.p_ext_initial) / (self.theta * self.p_ext_initial) if self.p_ext_initial != 0 else 0.0
 
         if self.trend == 'downtrend':
             self.osv_list_dt.append(osv)
@@ -167,9 +198,11 @@ class DCTracker:
             self.tmv_list_ut.append(tmv)
 
         self.if_os.append(os_length_new > 0)
-        self.trend_history.append(self.trend)
+        self.trend_history.append(self.trend)  # Trend que termina
+
         self.dc_duration = dc_duration_new
 
+        # Cambio de trend
         self.trend = new_trend
         self.p_ext_initial = self.p_ext
         self.p_ext = p_current
@@ -178,6 +211,42 @@ class DCTracker:
         self.t_dcc = t_current
         self.os_length = 0
 
+    def __str__(self) -> str:
+        p_ext_str = f"{self.p_ext:.6f}" if self.p_ext is not None else "N/A"
+        p_dcc_star_str = f"{self.p_dcc_star:.6f}" if self.p_dcc_star is not None else "N/A"
+        p_init_str = f"{self.p_ext_initial:.6f}" if self.p_ext_initial is not None else "N/A"
+        t_ext_str = str(self.t_ext) if self.t_ext is not None else "N/A"
+        t_dcc_str = str(self.t_dcc) if self.t_dcc is not None else "N/A"
+
+        lines = [
+            "=== DCTracker State ===",
+            f"Theta: {self.theta:.4f}",
+            f"Current trend: {self.trend or 'Not initialized'}",
+            f"Current extreme price (p_ext): {p_ext_str}",
+            f"Time of extreme (t_ext): {t_ext_str}",
+            f"Theoretical DCC (p_dcc_star): {p_dcc_star_str}",
+            f"Initial extreme cycle: {p_init_str}",
+            f"Last DCC time: {t_dcc_str}",
+            f"Current OS length: {self.os_length}",
+            f"Last DC duration: {self.dc_duration}",
+            f"Is DCC now?: {self.is_dcc}",
+            "",
+            "=== Statistics ===",
+            f"DC events: {self.n_dc}",
+            f"OS events: {self.n_os}",
+            f"Total DC time: {self.total_t_dc}",
+            f"Total OS time: {self.total_t_os}",
+            "",
+            f"OSV DT ({len(self.osv_list_dt)}): {[round(x,4) for x in self.osv_list_dt]}",
+            f"OSV UT ({len(self.osv_list_ut)}): {[round(x,4) for x in self.osv_list_ut]}",
+            f"TMV DT ({len(self.tmv_list_dt)}): {[round(x,4) for x in self.tmv_list_dt]}",
+            f"TMV UT ({len(self.tmv_list_ut)}): {[round(x,4) for x in self.tmv_list_ut]}",
+            "",
+            f"Recent trends: {self.trend_history}",
+            f"Recent OS flags: {self.if_os}",
+            "============================="
+        ]
+        return "\n".join(lines)
 
 class DCTrader:
     def __init__(self, 
@@ -196,11 +265,12 @@ class DCTrader:
         self.prices = self.stock.data['Close']
         self.dates = self.stock.data['Date']
         self.thresholds = sorted(thresholds)                        # Ensure ordered
+        self.states_list = None
         self.strategies = strategies
         self.n_strats = len(self.strategies)                        # Number of strategies
         self.n_ths = len(self.thresholds)                           # Number of thresholds
         self.trackers: Dict[float, DCTracker] = {
-            th: DCTracker(th, t0=0, p0=self.prices.iloc[0]) for th in self.thresholds
+            th: DCTracker(th) for th in self.thresholds
         }
         self.states = self._precompute_states() if is_train else None
         self.position = False
@@ -210,7 +280,6 @@ class DCTrader:
         self.sell_cost_factor = 1 - self.operation_cost
 
         self.combination_matrix = self._get_combination_matrix()
-
         self.weights: Optional[np.ndarray] = None
 
     def _get_combination_matrix(self):
@@ -221,63 +290,53 @@ class DCTrader:
                 combos.append((s_idx, th_idx))
         return combos
 
-    def _precompute_states(self) -> Dict[float, Any]:
-        states = {}
-        for th in self.thresholds:
-            tracker = self.trackers[th]
-            # Process all prices to populate statistics
-            for t in range(1, len(self.prices)):
-                tracker.update(t_current=t, p_current=self.prices.iloc[t])
+    def reset_trackers(self):
+        self.trackers = {th: DCTracker(th) for th in self.thresholds}
 
-            # Default values
+    def _precompute_states(self) -> None:
+        self.states_list = [None] * len(self.thresholds)
+
+        for th_idx, th in enumerate(self.thresholds):
+            tracker = DCTracker(th)  # Tracker independiente para precompute
+
+            # Procesar todos los precios para poblar listas históricas
+            for t_current, p_current in enumerate(self.prices):
+                tracker.update(t_current=t_current, p_current=p_current)
+
+            # Defaults seguros
             osv_best_dt = osv_best_ut = 1.0
             tmv_best_dt = tmv_best_ut = 1.0
+            rd = 1
+            rn = 1
 
-            for trend_t, osv_list in [('dt', tracker.osv_list_dt), ('ut', tracker.osv_list_ut)]:
-                if osv_list:
-                    values = sorted(osv_list)
-                    n = len(values)
-                    quartiles = [
-                        np.median(values[i * n // 4:(i + 1) * n // 4])
-                        for i in range(4) if (i + 1) * n // 4 > i * n // 4
-                    ]
-                    if quartiles:
-                        best = max(quartiles, key=lambda c: compute_simple_sr(th, c, self.prices, 'osv', trend_t))
-                        if trend_t == 'dt':
-                            osv_best_dt = best
-                        else:
-                            osv_best_ut = best
+            # osv_best y tmv_best: percentil 95% histórico (más fiel al paper)
+            # Si no hay datos, queda en 1.0 (valor conservador alcanzable)
+            if tracker.osv_list_dt:
+                osv_best_dt = np.percentile(tracker.osv_list_dt, 95)
+            if tracker.osv_list_ut:
+                osv_best_ut = np.percentile(tracker.osv_list_ut, 95)
 
-            for trend_t, tmv_list in [('dt', tracker.tmv_list_dt), ('ut', tracker.tmv_list_ut)]:
-                if tmv_list:
-                    values = sorted(tmv_list)
-                    n = len(values)
-                    quartiles = [
-                        np.median(values[i * n // 4:(i + 1) * n // 4])
-                        for i in range(4) if (i + 1) * n // 4 > i * n // 4
-                    ]
-                    if quartiles:
-                        best = max(quartiles, key=lambda c: compute_simple_sr(th, c, self.prices, 'tmv', trend_t))
-                        if trend_t == 'dt':
-                            tmv_best_dt = best
-                        else:
-                            tmv_best_ut = best
+            if tracker.tmv_list_dt:
+                tmv_best_dt = np.percentile(tracker.tmv_list_dt, 95)
+            if tracker.tmv_list_ut:
+                tmv_best_ut = np.percentile(tracker.tmv_list_ut, 95)
 
-            rd = tracker.total_t_os / tracker.total_t_dc if tracker.total_t_dc > 0 else 2.0
-            rn = tracker.n_os / tracker.n_dc if tracker.n_dc > 0 else 0.5
+            # rd y rn: ratios históricos promedio (exacto al paper)
+            if tracker.total_t_dc > 0:
+                rd = tracker.total_t_os / tracker.total_t_dc
+            if tracker.n_dc > 0:
+                rn = tracker.n_os / tracker.n_dc  # Probabilidad empírica de OS
 
+            # Crear estado simple
             state = type('State', (), {})()
-
             state.osv_best_dt = osv_best_dt
             state.osv_best_ut = osv_best_ut
             state.tmv_best_dt = tmv_best_dt
             state.tmv_best_ut = tmv_best_ut
-
             state.rd = rd
             state.rn = rn
-            states[th] = state
 
-        return states
+            self.states_list[th_idx] = state
 
     def fit(self, 
             pop_size = 150,
@@ -367,25 +426,51 @@ class DCTrader:
                 setattr(new_state, attr, getattr(base_state, attr))
         return new_state
 
-    def predict(self, t_current: int, p_current: float) -> int:
-        # Update tracker by theta
-        for th in self.thresholds:
-            self.trackers[th].update(t_current=t_current, p_current=p_current)
+    def predict(self, t_current: int, p_current: float, weights: np.ndarray= None, reset_tracker: bool = False) -> int:
+        """
+        Genera recomendación ensemble.
+        - Si al menos 2 sub-estrategias votan non-hold → se ignora hold y se decide entre buy/sell.
+        - Si menos de 2 votos non-hold → soft-voting normal (hold puede ganar).
+        """
+
+        if weights is None:
+            weights = self.weights
+        if weights is None:
+            raise ValueError("Weights not set; run fit or load_model first")
+
+        if reset_tracker:
+            self.reset_trackers()
+
+        # Update trackers live
+        for tracker in self.trackers.values():
+            tracker.update(t_current=t_current, p_current=p_current)
 
         buy_weight = sell_weight = hold_weight = 0.0
-        num_non_hold = 0
-
+        num_non_hold = 0  # Contador de votos buy o sell
+        # print(f'time: {t_current}')
         for strat_idx, theta_idx in self.combination_matrix:
-            w = self.weights[strat_idx, theta_idx] if self.weights is not None else 0
-            if w == 0:
+            w = weights[strat_idx, theta_idx]
+            if w == 0.0:
                 continue
 
             theta = self.thresholds[theta_idx]
             tracker = self.trackers[theta]
-            base_state = self.states[theta] if self.states is not None else None
-            state = self._copy_state(base_state)
 
-            # Dynamic attributes
+            # Acceso a state precomputado por índice (robusto)
+            if self.states_list is None or len(self.states_list) <= theta_idx:
+                base_state = None
+            else:
+                base_state = self.states_list[theta_idx]
+
+            if base_state is None:
+                class DummyState:
+                    osv_best_dt = osv_best_ut = tmv_best_dt = tmv_best_ut = 1.0
+                    rd = 2.0
+                    rn = 0.5
+                base_state = DummyState()
+
+            state = type('State', (), {k: v for k, v in base_state.__dict__.items()})()
+
             state.trend = tracker.trend
             state.p_ext = tracker.p_ext
             state.p_ext_initial = tracker.p_ext_initial
@@ -398,33 +483,57 @@ class DCTrader:
             state.theta = theta
 
             if state.trend == 'downtrend':
-                state.osv_best = getattr(state, 'osv_best_dt', 1.0)
-                state.tmv_best = getattr(state, 'tmv_best_dt', 1.0)
-            else:  # uptrend
-                state.osv_best = getattr(state, 'osv_best_ut', 1.0)
-                state.tmv_best = getattr(state, 'tmv_best_ut', 1.0)
+                state.osv_best = base_state.osv_best_dt
+                state.tmv_best = base_state.tmv_best_dt
+            else:
+                state.osv_best = base_state.osv_best_ut
+                state.tmv_best = base_state.tmv_best_ut
 
             strat = self.strategies[strat_idx](t_current, p_current, self.position, state)
-            rec = strat.recommendation  # 0: hold, 1: buy, 2: sell
+            rec = strat.recommendation
 
-            if rec == 1:
+            if rec == 1:        # buy
                 buy_weight += w
                 num_non_hold += 1
-            elif rec == 2:
+            elif rec == 2:      # sell
                 sell_weight += w
                 num_non_hold += 1
-            else:
+            else:               # hold
                 hold_weight += w
 
+            # print(f'recommendation: {rec}')
+            # print(f'buy: {buy_weight}')
+            # print(f'sell: {sell_weight}')
+            # print(f'hold: {hold_weight}')
+
+
+        # Al menos 2 votos non-hold → ignorar hold
         if num_non_hold >= 2:
-            hold_weight = 0
+            hold_weight = 0.0
+
+        # print('total recommendations')
+        # print(f'buy: {buy_weight}')
+        # print(f'sell: {sell_weight}')
+        # print(f'hold: {hold_weight}')
+
+        # print(f'non hold: {num_non_hold}')
 
         total = buy_weight + sell_weight + hold_weight
         if total == 0:
-            return 0  # hold
+            return 0  # hold seguro
+
+        # print('total recommendations normalized')
+        # print(f'buy: {buy_weight/ total}')
+        # print(f'sell: {sell_weight/ total}')
+        # print(f'hold: {hold_weight/ total}')
+
+        # print(f'recomendation: {int(np.argmax([hold_weight / total, buy_weight / total, sell_weight / total]))}')
+        # print('')
+        
 
         probs = [hold_weight / total, buy_weight / total, sell_weight / total]
-        return int(np.argmax(probs))  # 0 hold, 1 buy, 2 sell
+        return int(np.argmax(probs))
+
 
     def predict_single(self, t_current: int, p_current: float, strategy_idx: int, threshold_idx: int) -> int:
         if strategy_idx < 0 or strategy_idx >= self.n_strats:
@@ -466,28 +575,33 @@ class DCTrader:
             weights = self.weights
         if weights is None:
             raise ValueError("Weights not set; run fit or load_model first")
-
-        position = False
+        
+        self.position = False
         buy_price = 0.0
         returns = []
         trades = 0
 
-        for t in range(1, len(self.prices)):
-            p_current = self.prices.iloc[t]
-            t_current = t
-            action = self.predict(t_current, p_current)
+        self.reset_trackers()
+        
+        for t_current, p_current in enumerate(self.prices):
+
+            # print("")
+            # print(f'current price: {p_current}')
+            # print(f'current time: {t_current}')
+            action = self.predict(t_current, p_current, weights)
+            # print(action)
             if action == 0:
                 continue
-            if action == 1 and not position:
+            if action == 1 and not self.position:
                 buy_price = p_current * self.buy_cost_factor 
-                position = True
-            elif action == 2 and position:
+                self.position = True
+            elif action == 2 and self.position:
                 sell_price = p_current * self.sell_cost_factor
                 ret = (sell_price - buy_price) / buy_price
                 returns.append(ret)
-                position = False
+                self.position = False
                 trades += 1
-        if position:
+        if self.position:
             sell_price = self.prices.iloc[-1] * self.sell_cost_factor
             ret = (sell_price - buy_price) / buy_price
             returns.append(ret)
@@ -502,8 +616,8 @@ class DCTrader:
         sr = mean_r / std_r if std_r > 0 else 0
         var = np.percentile(returns, 5)
         tor = trades / len(self.prices) if len(self.prices) > 0 else 0
-        return {'RoR': ror, 'STD': std_r, 'SR': sr, 'VaR': var, 'ToR': tor, 'returns': returns}
 
+        return {'RoR': ror, 'STD': std_r, 'SR': sr, 'VaR': var, 'ToR': tor, 'returns': returns, 'trades': trades}
 
 class Backtest:
     def __init__(self, trader: DCTrader):
@@ -546,9 +660,7 @@ class Backtest:
         returns = []
         trades = 0
 
-        for t in range(1, len(self.prices)):
-            p_current = self.prices.iloc[t]
-            t_current = t
+        for t_current, p_current in enumerate(self.prices):
             tracker.update(t_current, p_current)
             action = self.trader.predict_single(t_current, p_current, strategy_idx, threshold_idx)
             if action == 1 and not position:
