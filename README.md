@@ -3,7 +3,7 @@ CEIA FIUBA - Evolutionary Algorithms - Final Project
 
 ## About this project
 
-This project is an implementation of the paper [doc/Salman et al 2026.pdf](A genetic algorithm for the optimization of multi-threshold trading strategies in the directional changes paradigm).
+This project is an implementation of the paper [A genetic algorithm for the optimization of multi-threshold trading strategies in the directional changes paradigm (2026)](doc/Salman%20et%20al%202026.pdf).
 
 The model, called **MSTGAM**, uses a **Genetic Algorithm (GA)** to optimize an ensemble of 8 Directional Changes (DC)-based trading strategies, operating simultaneously with multiple thresholds (θ). The objective is to maximize the **Sharpe Ratio (SR)**.
 
@@ -20,6 +20,14 @@ The project was structured as follows.
 └── src                                 # Main source of the project
 
 ```
+
+## Code implementation
+
+- Directional Changes (DC): The core is the DCTracker class in [src/main.py](src/main.py), which decomposes the price series into significant events (uptrends/downtrends and overshoots) using a threshold θ, instead of fixed time intervals.
+- 8 DC-based trading strategies ([src/strategies.py](src/strategies.py)): Each strategy (St1 to St8) generates buy/sell signals according to specific conditions on OSV, TMV, overshoot duration, historical patterns, etc. More strategies can be implemented from the StrategyBase class.
+- Multi-threshold ensemble (DCTrader class in [src/main.py](src/main.py)): Combines multiple instances of the 8 strategies running on different thresholds θ. Each combination (strategy + θ) has a weight that determines its influence on the final decision.
+- Optimization with Genetic Algorithm (GATrainer class in [src/trainer.py](src/trainer.py)): Uses DEAP to evolve the weights of the ensemble. The fitness function maximizes the Sharpe Ratio, penalizes excessive turnover, and rewards positive returns. It also includes a PSO alternative.
+- Backtesting and comparison (Backtest class in [src/main.py](src/main.py)): Allows evaluation of the optimized ensemble (MSTGAM), individual strategies, and Buy & Hold. Computes key metrics (RoR, STD, SR, VaR@5%, ToR, number of trades) and plots temporal equity curves.
 
 ## Prerequisites
 
@@ -44,4 +52,48 @@ Follow this steps:
     ```bash
     poetry env activate
     ```
-1. Now, you're ready to run the notebooks and make your own simulations.
+1. Now, you're ready to run the notebooks and make your own simulations following the next typical steps:
+
+- For training:
+
+   ```python
+        from main import DCTrader, Backtest
+        from strategies import St1, St2, ..., St8
+        from trainer import GATrainer
+
+        thresholds = [0.001, 0.002, ..., 0.01]
+        strategies = [St1, St2, St3, St4, St5, St6, St7, St8]
+
+        ticker = 'AAPL'
+
+        trader = DCTrader(ticker=ticker, thresholds=thresholds, strategies=strategies, is_train=True)
+
+        trader.fit()          # Train with GA
+        trader.save_model()
+
+        backtest = Backtest(trader)
+        print(backtest.compare_metrics(['MSTGAM', 'buy_hold']))
+        backtest.plot_equity_curves(['MSTGAM', 'buy_hold'])
+    ```
+
+- For inference:
+
+   ```python
+        from main import DCTrader, Backtest
+
+        ticker = 'AAPL'
+
+        trader = DCTrader(
+            ticker=ticker,
+            is_train=False,
+            start_date='2024-01-01',
+            end_date='2025-12-01'
+        )
+
+        trader.load_model()
+        print("Modelo MSTGAM cargado correctamente. Pesos optimizados asignados.")
+
+        backtest = Backtest(trader)
+        print(backtest.compare_metrics(['MSTGAM', 'buy_hold']))
+        backtest.plot_equity_curves(['MSTGAM', 'buy_hold'])
+    ```

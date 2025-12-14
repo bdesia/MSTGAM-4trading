@@ -251,8 +251,8 @@ class DCTracker:
 class DCTrader:
     def __init__(self, 
                  ticker: str, 
-                 thresholds: List[float],
-                 strategies: List[StrategyBase],
+                 thresholds: List[float] = None,
+                 strategies: List[StrategyBase] = None,
                  is_train: bool = False,
                  start_date: Optional[str] = None, 
                  end_date: Optional[str] = None,
@@ -264,6 +264,16 @@ class DCTrader:
         self.stock.load_data(start_date, end_date)
         self.prices = self.stock.data['Close']
         self.dates = self.stock.data['Date']
+
+        if not thresholds:
+            thresholds = [0.00098, 0.0022, 0.0048, 0.0072, 0.0098, 0.0122, 0.0155, 0.017, 0.02, 0.0255]
+            print('Default thresholds loaded')
+
+        if not strategies:
+            from strategies import St1, St2, St3, St4, St5, St6, St7, St8
+            strategies = [St1, St2, St3, St4, St5, St6, St7, St8]
+            print('Default strategies loaded')       
+
         self.thresholds = sorted(thresholds)                        # Ensure ordered
         self.states_list = None
         self.strategies = strategies
@@ -619,83 +629,124 @@ class DCTrader:
 
         return {'RoR': ror, 'STD': std_r, 'SR': sr, 'VaR': var, 'ToR': tor, 'returns': returns, 'trades': trades}
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from typing import List, Union, Dict, Any, Tuple
+
+
 class Backtest:
     def __init__(self, trader: DCTrader):
         self.trader = trader
         self.prices = trader.prices
         self.dates = trader.dates
+        self.n_days = len(self.prices)
 
     def run_ensemble(self) -> Dict[str, Any]:
+        """Ejecuta backtest del modelo MSTGAM (ensemble optimizado por GA)"""
         return self.trader.backtest()
 
     def run_buy_hold(self) -> Dict[str, Any]:
-        if len(self.prices) < 2:
-            return {'RoR': 0, 'STD': 0, 'SR': 0, 'VaR': 0, 'ToR': 0, 'returns': [0]}
+        """Buy & Hold con costos de transacción (una compra al inicio, una venta al final)"""
+        if self.n_days < 2:
+            return {'RoR': 0.0, 'STD': 0.0, 'SR': 0.0, 'VaR': 0.0, 'ToR': 0.0, 'trades': 0}
 
         buy_price = self.prices.iloc[0] * self.trader.buy_cost_factor
         sell_price = self.prices.iloc[-1] * self.trader.sell_cost_factor
         ret = (sell_price - buy_price) / buy_price
-        returns = [ret]
-        mean_r = np.mean(returns)
-        std_r = np.std(returns)
-        ror = ret
-        sr = mean_r / std_r if std_r > 0 else 0
-        var = np.percentile(returns, 5) if len(returns) > 1 else 0
-        tor = 2 / len(self.prices)  # Buy and sell once
-        return {'RoR': ror, 'STD': std_r, 'SR': sr, 'VaR': var, 'ToR': tor, 'returns': returns}
+
+        returns = [ret]  # Un solo retorno compuesto
+        mean_r = ret
+        std_r = 0.0  # Buy & Hold tiene un solo retorno → STD = 0
+        sr = 0.0     # Por convención en el paper, SR = 0 cuando STD = 0
+        var = ret    # Peor caso es el único retorno
+        tor = 2 / self.n_days  # Dos operaciones (buy + sell)
+
+        return {
+            'RoR': ret,
+            'STD': std_r,
+            'SR': sr,
+            'VaR': var,
+            'ToR': tor,
+            'returns': returns,
+            'trades': 1  # Una operación completa
+        }
 
     def run_single_strategy(self, strategy_idx: int, threshold_idx: int) -> Dict[str, Any]:
+        """Backtest de una estrategia individual (una de las 8 x un threshold específico)"""
         if strategy_idx < 0 or strategy_idx >= self.trader.n_strats:
-            raise ValueError(f"strategy_idx must be between 0 and {self.trader.n_strats - 1}")
+            raise ValueError(f"strategy_idx debe estar entre 0 y {self.trader.n_strats - 1}")
         if threshold_idx < 0 or threshold_idx >= self.trader.n_ths:
-            raise ValueError(f"threshold_idx must be between 0 and {self.trader.n_ths - 1}")
+            raise ValueError(f"threshold_idx debe estar entre 0 y {self.trader.n_ths - 1}")
 
         theta = self.trader.thresholds[threshold_idx]
-
-        # Recrear tracker para resetear estado histórico
-        tracker = DCTracker(theta, t0=0, p0=self.prices.iloc[0])
+        tracker = DCTracker(theta)  # Tracker independiente y limpio
 
         position = False
         buy_price = 0.0
         returns = []
         trades = 0
 
+        # Reset explícito
+        tracker = DCTracker(theta)
+
         for t_current, p_current in enumerate(self.prices):
-            tracker.update(t_current, p_current)
+            tracker.update(t_current=t_current, p_current=p_current)
             action = self.trader.predict_single(t_current, p_current, strategy_idx, threshold_idx)
-            if action == 1 and not position:
+
+            if action == 1 and not position:  # Buy
                 buy_price = p_current * self.trader.buy_cost_factor
                 position = True
-            elif action == 2 and position:
+            elif action == 2 and position:  # Sell
                 sell_price = p_current * self.trader.sell_cost_factor
                 ret = (sell_price - buy_price) / buy_price
                 returns.append(ret)
                 position = False
                 trades += 1
+
+        # Cerrar posición abierta al final
         if position:
             sell_price = self.prices.iloc[-1] * self.trader.sell_cost_factor
             ret = (sell_price - buy_price) / buy_price
             returns.append(ret)
             trades += 1
-        if not returns:
-            returns = [0]
-        mean_r = np.mean(returns)
-        std_r = np.std(returns)
-        ror = np.prod(1 + np.array(returns)) - 1
-        sr = mean_r / std_r if std_r > 0 else 0
-        var = np.percentile(returns, 5) if len(returns) > 1 else 0
-        tor = trades / len(self.prices) if len(self.prices) > 0 else 0
-        return {'RoR': ror, 'STD': std_r, 'SR': sr, 'VaR': var, 'ToR': tor, 'returns': returns}
 
-    def compare_metrics(self, strategies: List[Union[str, tuple]] = None) -> pd.DataFrame:
+        if not returns:
+            returns = [0.0]
+            ror = 0.0
+            mean_r = 0.0
+            std_r = 0.0
+            sr = 0.0
+            var = 0.0
+        else:
+            ror = np.prod(1 + np.array(returns)) - 1
+            mean_r = np.mean(returns)
+            std_r = np.std(returns)
+            sr = mean_r / std_r if std_r > 0 else 0.0
+            var = np.percentile(returns, 5)  # VaR al 5% (peor 5% de retornos)
+
+        tor = trades / self.n_days if self.n_days > 0 else 0.0
+
+        return {
+            'RoR': ror,
+            'STD': std_r,
+            'SR': sr,
+            'VaR': var,
+            'ToR': tor,
+            'returns': returns,
+            'trades': trades
+        }
+
+    def compare_metrics(self, strategies: List[Union[str, Tuple[int, int]]] = None) -> pd.DataFrame:
         """
-        Compara métricas de diferentes estrategias.
-        strategies: Lista de 'ensemble', 'buy_hold', o tuplas (strategy_idx, theta)
+        Compara métricas clave como en Tabla 3 del paper.
+        strategies: ['MSTGAM', 'buy_hold'] o tuplas (strategy_idx, threshold_idx)
         """
         if strategies is None:
             strategies = ['MSTGAM', 'buy_hold']
 
         results = {}
+
         for strat in strategies:
             if strat == 'MSTGAM':
                 name = 'MSTGAM'
@@ -704,54 +755,75 @@ class Backtest:
                 name = 'Buy & Hold'
                 metrics = self.run_buy_hold()
             elif isinstance(strat, tuple) and len(strat) == 2:
-                s_idx, t_idx = strat
-                name = f'St{s_idx+1} (theta_{t_idx})'
-                metrics = self.run_single_strategy(s_idx, t_idx)
+                s_idx, th_idx = strat
+                theta_val = self.trader.thresholds[th_idx]
+                name = f'S{s_idx + 1}-θ{th_idx}'  # Ej: S1-θ3 → Estrategia 1 con threshold índice 3
+                metrics = self.run_single_strategy(s_idx, th_idx)
             else:
-                raise ValueError(f"Invalid strategy: {strat}")
+                raise ValueError(f"Estrategia no válida: {strat}")
 
             results[name] = {
-                'RoR': metrics['RoR'],
-                'STD': metrics['STD'],
-                'SR': metrics['SR'],
-                'VaR': metrics['VaR'],
-                'ToR': metrics['ToR'],
+                'RoR': round(metrics['RoR'], 4),
+                'STD': round(metrics['STD'], 4),
+                'SR': round(metrics['SR'], 4),
+                'VaR': round(metrics['VaR'], 4),
+                'ToR': round(metrics['ToR'], 4),
+                'Trades': metrics['trades']
             }
 
         df = pd.DataFrame(results).T
-
+        df = df[['RoR', 'STD', 'SR', 'VaR', 'ToR', 'Trades']]
         return df
 
-    def plot_returns(self, strategies: List[Union[str, tuple]] = None, figsize=(12, 6)):
+    def plot_equity_curves(self, strategies: List[Union[str, Tuple[int, int]]] = None, figsize=(14, 8)):
         """
-        Grafica retornos acumulados de diferentes estrategias.
+        Grafica curvas de equity (retorno acumulado vs tiempo físico)
         """
         if strategies is None:
-            strategies = ['ensemble', 'buy_hold']
+            strategies = ['MSTGAM', 'buy_hold']
 
-        fig, ax = plt.subplots(figsize=figsize)
+        plt.figure(figsize=figsize)
+        dates = self.dates
 
         for strat in strategies:
             if strat == 'MSTGAM':
-                name = 'MSTGAM'
+                name = 'MSTGAM (GA Optimized)'
                 metrics = self.run_ensemble()
             elif strat == 'buy_hold':
                 name = 'Buy & Hold'
-                metrics = self.run_buy_hold()
-            elif isinstance(strat, tuple) and len(strat) == 2:
-                s_idx, t_idx = strat
-                name = f'St{s_idx+1} (theta_{t_idx})'
-                metrics = self.run_single_strategy(s_idx, t_idx)
+                # Equity lineal desde inicio hasta final
+                initial = self.prices.iloc[0] * self.trader.buy_cost_factor
+                final = self.prices.iloc[-1] * self.trader.sell_cost_factor
+                equity = np.linspace(0, (final - initial) / initial, self.n_days)
+                plt.plot(dates, equity, label=name, linewidth=2)
+                continue
+            elif isinstance(strat, tuple):
+                s_idx, th_idx = strat
+                theta_val = self.trader.thresholds[th_idx]
+                name = f'S{s_idx + 1}-θ{th_idx}'
+                metrics = self.run_single_strategy(s_idx, th_idx)
             else:
-                raise ValueError(f"Invalid strategy: {strat}")
+                raise ValueError(f"Estrategia no válida: {strat}")
 
             returns = metrics['returns']
-            cum_returns = np.cumprod(1 + np.array(returns)) - 1
-            ax.plot(range(len(cum_returns)), cum_returns, label=name)
+            # Construir equity curve diaria
+            equity = [0.0]
+            for ret in returns:
+                equity.append(equity[-1] + ret)  # Suma simple (compounding implícito en retornos)
+            # Expandir para todos los días (mantener último valor hasta próximo trade)
+            full_equity = []
+            trade_idx = 0
+            for i in range(self.n_days):
+                if trade_idx < len(equity) - 1 and i >= trade_idx * (self.n_days // max(len(returns), 1)):
+                    trade_idx += 1
+                full_equity.append(equity[min(trade_idx, len(equity) - 1)])
 
-        ax.set_title('Retornos Acumulados de Estrategias')
-        ax.set_xlabel('Número de Trades')
-        ax.set_ylabel('Retorno Acumulado')
-        ax.legend()
-        ax.grid(True)
+            plt.plot(dates, full_equity, label=name)
+
+        plt.title('Curvas de Equity - Comparación de Estrategias')
+        plt.xlabel('Fecha')
+        plt.ylabel('Retorno Acumulado')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
         plt.show()
