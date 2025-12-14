@@ -461,9 +461,10 @@ class DCTrader:
         strat = self.strategies[strategy_idx](t_current, p_current, self.position, state)
         return strat.recommendation
 
-    def backtest(self) -> Dict[str, Any]:
-
-        if self.weights is None:
+    def backtest(self, weights = None) -> Dict[str, Any]:
+        if weights is None:
+            weights = self.weights
+        if weights is None:
             raise ValueError("Weights not set; run fit or load_model first")
 
         position = False
