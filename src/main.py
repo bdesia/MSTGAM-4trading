@@ -123,20 +123,6 @@ class DCTracker:
         self.if_os: List[bool] = []
         self.memory = memory
 
-        # Estadísticas
-        self.osv_list_dt: List[float] = []
-        self.osv_list_ut: List[float] = []
-        self.tmv_list_dt: List[float] = []
-        self.tmv_list_ut: List[float] = []
-        self.total_t_os = 0
-        self.total_t_dc = 0
-        self.n_os = 0
-        self.n_dc = 0
-
-        self.trend_history: List[str] = []
-        self.if_os: List[bool] = []
-        self.memory = memory
-
     def update(self, t_current: int, p_current: float):
         """
         Process new time/price; detect DC, update stats.
@@ -153,11 +139,12 @@ class DCTracker:
 
         self.is_dcc = False
 
+        self.os_length += 1 # actualiza siempre, corrige en _confirm_dc si es necesario
+        
         if self.trend == 'downtrend':
             if p_current < self.p_ext:  # Actualiza low → OS phase
                 self.p_ext = p_current
                 self.t_ext = t_current
-                self.os_length += 1
             if p_current >= self.p_ext * (1 + self.theta):
                 self._confirm_dc(t_current, p_current, 'uptrend')
 
@@ -165,7 +152,6 @@ class DCTracker:
             if p_current > self.p_ext:  # Actualiza high → OS phase
                 self.p_ext = p_current
                 self.t_ext = t_current
-                self.os_length += 1
             if p_current <= self.p_ext * (1 - self.theta):
                 self._confirm_dc(t_current, p_current, 'downtrend')
 
@@ -177,8 +163,8 @@ class DCTracker:
     def _confirm_dc(self, t_current: int, p_current: float, new_trend: str):
         self.is_dcc = True
 
-        dc_duration_new = max(0, t_current - self.t_ext)
-        os_length_new = max(0, self.t_ext - self.t_dcc)
+        dc_duration_new = t_current - self.t_ext
+        os_length_new = self.t_ext - self.t_dcc     # corrige os_length
 
         self.total_t_dc += dc_duration_new
         self.total_t_os += os_length_new
@@ -205,7 +191,7 @@ class DCTracker:
         self.trend = new_trend
         self.p_ext_initial = self.p_ext
         self.p_ext = p_current
-        self.p_dcc_star = p_current * (1 - self.theta) if new_trend == 'uptrend' else p_current * (1 + self.theta)
+        self.p_dcc_star = self.p_ext_initial * (1 + self.theta) if new_trend == 'uptrend' else self.p_ext_initial * (1 - self.theta)
         self.t_ext = t_current
         self.t_dcc = t_current
         self.os_length = 0
