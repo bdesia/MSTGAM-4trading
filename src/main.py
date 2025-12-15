@@ -30,9 +30,9 @@ def compute_simple_sr(theta, candidate, prices, value_type='osv', trend_type='dt
         p_current = prices.iloc[t]
         tracker.update(t_current=t, p_current=p_current)
         if value_type == 'osv':
-            val_cur = abs((p_current - tracker.p_dcc_star) / (theta * tracker.p_dcc_star))
+            val_cur = tracker.osv
         else:
-            val_cur = abs((p_current - tracker.p_ext_initial) / (theta * tracker.p_ext_initial))
+            val_cur = tracker.tmv
         if trend_type == 'dt' and tracker.trend == 'downtrend' and not position and val_cur >= candidate and t > tracker.t_dcc:
             buy_price = p_current * (1 + operation_cost)
             position = True
@@ -51,6 +51,26 @@ def compute_simple_sr(theta, candidate, prices, value_type='osv', trend_type='dt
     std_r = np.std(returns) if len(returns) > 1 else 0.001
     return mean_r / std_r if std_r > 0 else 0
 
+def medians_of_quartiles(array: np.ndarray) -> List[float]:
+
+    # Get quartiles Q1, Q2, Q3
+    q1 = np.percentile(array, 25)
+    q2 = np.percentile(array, 50) 
+    q3 = np.percentile(array, 75)
+
+    # Split in 4 groups
+    group1 = array[array <= q1]                     # First cuartil: ≤ Q1
+    group2 = array[(array > q1) & (array <= q2)]    # Second: > Q1 y ≤ Q2
+    group3 = array[(array > q2) & (array <= q3)]    # Third: > Q2 y ≤ Q3
+    group4 = array[array > q3]                      # Fourth: > Q3
+    
+    # Calculate medians
+    median1 = np.median(group1)
+    median2 = np.median(group2)
+    median3 = np.median(group3)
+    median4 = np.median(group4)
+
+    return [median1, median2, median3, median4]
 
 class StockDataLoader:
     def __init__(self, ticker: str):
@@ -108,12 +128,10 @@ class DCTracker:
         self.dc_duration = 0
         self.is_dcc = False
         self.os_length = 0
+        
+        self.osv = None
+        self.tmv = None
 
-        # Estadísticas
-        self.osv_list_dt: List[float] = []
-        self.osv_list_ut: List[float] = []
-        self.tmv_list_dt: List[float] = []
-        self.tmv_list_ut: List[float] = []
         self.total_t_os = 0
         self.total_t_dc = 0
         self.n_os = 0
@@ -138,7 +156,7 @@ class DCTracker:
             return
 
         self.is_dcc = False
-
+        
         self.os_length += 1 # actualiza siempre, corrige en _confirm_dc si es necesario
         
         if self.trend == 'downtrend':
@@ -155,6 +173,10 @@ class DCTracker:
             if p_current <= self.p_ext * (1 - self.theta):
                 self._confirm_dc(t_current, p_current, 'downtrend')
 
+        # OSV y TMV
+        self.osv = abs(p_current - self.p_dcc_star) / (self.theta * self.p_dcc_star) if self.p_dcc_star else 0.0
+        self.tmv = abs(p_current - self.p_ext_initial) / (self.theta * self.p_ext_initial) if self.p_ext_initial else 0.0
+
         # Trim history
         if len(self.trend_history) > self.memory:
             self.trend_history = self.trend_history[-self.memory:]
@@ -163,24 +185,13 @@ class DCTracker:
     def _confirm_dc(self, t_current: int, p_current: float, new_trend: str):
         self.is_dcc = True
 
-        dc_duration_new = t_current - self.t_ext
-        os_length_new = self.t_ext - self.t_dcc     # corrige os_length
+        dc_duration_new = max(0, t_current - self.t_ext)
+        os_length_new = max(0, self.t_ext - self.t_dcc)     # corrige os_length
 
         self.total_t_dc += dc_duration_new
         self.total_t_os += os_length_new
         self.n_dc += 1
         self.n_os += 1 if os_length_new > 0 else 0
-
-        # OSV y TMV
-        osv = abs(p_current - self.p_dcc_star) / (self.theta * self.p_dcc_star) if self.p_dcc_star != 0 else 0.0
-        tmv = abs(p_current - self.p_ext_initial) / (self.theta * self.p_ext_initial) if self.p_ext_initial != 0 else 0.0
-
-        if self.trend == 'downtrend':
-            self.osv_list_dt.append(osv)
-            self.tmv_list_dt.append(tmv)
-        else:
-            self.osv_list_ut.append(osv)
-            self.tmv_list_ut.append(tmv)
 
         self.if_os.append(os_length_new > 0)
         self.trend_history.append(self.trend)  # Trend que termina
@@ -215,17 +226,14 @@ class DCTracker:
             f"Current OS length: {self.os_length}",
             f"Last DC duration: {self.dc_duration}",
             f"Is DCC now?: {self.is_dcc}",
+            f"Current OSV: {self.osv}",
+            f"Current TMV: {self.tmv}",
             "",
             "=== Statistics ===",
             f"DC events: {self.n_dc}",
             f"OS events: {self.n_os}",
             f"Total DC time: {self.total_t_dc}",
             f"Total OS time: {self.total_t_os}",
-            "",
-            f"OSV DT ({len(self.osv_list_dt)}): {[round(x,4) for x in self.osv_list_dt]}",
-            f"OSV UT ({len(self.osv_list_ut)}): {[round(x,4) for x in self.osv_list_ut]}",
-            f"TMV DT ({len(self.tmv_list_dt)}): {[round(x,4) for x in self.tmv_list_dt]}",
-            f"TMV UT ({len(self.tmv_list_ut)}): {[round(x,4) for x in self.tmv_list_ut]}",
             "",
             f"Recent trends: {self.trend_history}",
             f"Recent OS flags: {self.if_os}",
@@ -292,31 +300,78 @@ class DCTrader:
         self.states_list = [None] * len(self.thresholds)
 
         for th_idx, th in enumerate(self.thresholds):
-            tracker = DCTracker(th)  # Tracker independiente para precompute
+            tracker = DCTracker(th)  # Tracker independiente para precompute en training
+
+            # Estadísticas
+            osv_list: List[float] = []
+            tmv_list: List[float] = []
+            
+            os_days_mask: List[bool] = []
+            uptrend_mask: List[bool] = []
 
             # Procesar todos los precios para poblar listas históricas
             for t_current, p_current in enumerate(self.prices):
                 tracker.update(t_current=t_current, p_current=p_current)
-
+                
+                # Guardar OSV y TMV histórico
+                osv_list.append(tracker.osv)
+                tmv_list.append(tracker.tmv)
+            
+                if tracker.is_dcc:
+                    os_days_mask.extend([True] * tracker.os_length) 
+                    os_days_mask.extend([True] * tracker.dc_duration) 
+            
+                uptrend_mask.append(tracker.trend == 'uptrend')
+            
+            osv_array = np.array(osv_list)
+            tmv_array = np.array(tmv_list)
+            uptrend_array = np.array(uptrend_mask)
+            os_days_array = np.array(os_days_mask)
+            
+            dt_os_mask = os_days_array & ~uptrend_array  # os and not uptrend
+            ut_os_mask = os_days_array & uptrend_array   # os and uptrend
+            
+            osv_array_dt = osv_array[dt_os_mask]
+            osv_array_ut = osv_array[ut_os_mask]
+            
+            tmv_array_dt = tmv_array[dt_os_mask]
+            tmv_array_ut = tmv_array[ut_os_mask]
+            
             # Defaults seguros
-            osv_best_dt = osv_best_ut = 1.0
-            tmv_best_dt = tmv_best_ut = 1.0
             rd = 1
             rn = 1
 
-            # osv_best y tmv_best: percentil 95% histórico (más fiel al paper)
-            # Si no hay datos, queda en 1.0 (valor conservador alcanzable)
-            if tracker.osv_list_dt:
-                osv_best_dt = np.percentile(tracker.osv_list_dt, 95)
-            if tracker.osv_list_ut:
-                osv_best_ut = np.percentile(tracker.osv_list_ut, 95)
+            osv_dt_quart_med = medians_of_quartiles(osv_array_dt)
+            osv_ut_quart_med = medians_of_quartiles(osv_array_ut)
+            tmv_dt_quart_med = medians_of_quartiles(tmv_array_dt)
+            tmv_ut_quart_med = medians_of_quartiles(tmv_array_ut)
 
-            if tracker.tmv_list_dt:
-                tmv_best_dt = np.percentile(tracker.tmv_list_dt, 95)
-            if tracker.tmv_list_ut:
-                tmv_best_ut = np.percentile(tracker.tmv_list_ut, 95)
+            best_sr = -np.inf
+            for i, cand in enumerate(osv_dt_quart_med):
+                sr = compute_simple_sr(th, cand, self.prices, 'osv', 'dt')
+                if sr > best_sr:
+                    best_sr = sr
+                    osv_best_dt = cand
+            best_sr = -np.inf   
+            for i, cand in enumerate(osv_ut_quart_med):
+                sr = compute_simple_sr(th, cand, self.prices, 'osv', 'ut')
+                if sr > best_sr:
+                    best_sr = sr
+                    osv_best_ut = cand
+            best_sr = -np.inf
+            for i, cand in enumerate(tmv_dt_quart_med):
+                sr = compute_simple_sr(th, cand, self.prices, 'tmv', 'dt')
+                if sr > best_sr:
+                    best_sr = sr
+                    tmv_best_dt = cand
+            best_sr = -np.inf
+            for i, cand in enumerate(tmv_ut_quart_med):
+                sr = compute_simple_sr(th, cand, self.prices, 'tmv', 'ut')
+                if sr > best_sr:
+                    best_sr = sr
+                    tmv_best_ut = cand
 
-            # rd y rn: ratios históricos promedio (exacto al paper)
+            # rd y rn: ratios históricos promedio
             if tracker.total_t_dc > 0:
                 rd = tracker.total_t_os / tracker.total_t_dc
             if tracker.n_dc > 0:

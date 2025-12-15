@@ -36,18 +36,14 @@ class St2(StrategyBase):
 # St3
 class St3(StrategyBase):
     def _condition(self, t_current, p_current, state):
-        p_dcc_star = state.p_dcc_star
-        theta = state.theta
-        osv_cur = abs((p_current - p_dcc_star) / (theta * p_dcc_star))
+        osv_cur = state.osv
         osv_best = state.osv_best
         return osv_cur >= osv_best
 
 # St4
 class St4(StrategyBase):
     def _condition(self, t_current, p_current, state):
-        theta = state.theta
-        p_ext_initial = state.p_ext_initial
-        tmv_cur = abs((p_current - p_ext_initial) / (theta * p_ext_initial))
+        tmv_cur = state.tmv
         tmv_best = state.tmv_best
         return tmv_cur >= tmv_best
 
