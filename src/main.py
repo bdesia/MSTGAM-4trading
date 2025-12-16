@@ -8,48 +8,104 @@ from typing import List, Dict, Any, Optional, Union
 from trainer import GATrainer
 from strategies import StrategyBase
 
-from typing import List, Union, Dict, Any, Tuple, Optional
+from typing import List, Union, Dict, Any, Tuple, Optional 
 
-def compute_simple_sr(theta, candidate, prices, value_type='osv', trend_type='dt', operation_cost = 0.0025):
+# ==================================================================================
+# UTILS
+# ==================================================================================
+
+def find_best_candidates(threshold: List[float], 
+        quart_med_dict: Dict[str, List[float]],
+        price_data: pd.Series, 
+        indicator: str = 'osv',
+        ) -> Dict[str, float]:
+                
+    dt_candidates = quart_med_dict.get('downtrend', [])
+    ut_candidates = quart_med_dict.get('uptrend', [])
+
+    if not dt_candidates or not ut_candidates:
+        return {'downtrend': np.nan, 'uptrend': np.nan}
+
+    best_metric = -np.inf
+    best_candidates: Dict[str, float] = {'downtrend': np.nan, 'uptrend': np.nan}
+
+    for cand_dt in dt_candidates:
+        for cand_ut in ut_candidates:
+            candidates = {'downtrend': cand_dt, 'uptrend': cand_ut}
+            metric = compute_daily_sr(threshold, candidates, price_data, indicator)
+
+            if metric > best_metric:
+                best_metric = metric
+                best_candidates = candidates
+
+    return best_candidates
+
+def compute_daily_sr(theta, candidates, prices: pd.Series, indicator='osv',
+                     operation_cost=0.0025, initial_capital=1.0, annualize=True):
     """
-    Calcula el Sharpe Ratio (SR) de una estrategia de trading simple basada en Directional Changes (DC).
+    Calcula Sharpe Ratio sobre retornos DIARIOS de la equity curve completa.
 
     La función simula una estrategia que entra en posición (compra en downtrend o vende en uptrend) 
     cuando el valor actual de OSV o TMV supera un candidato dado, y cierra al siguiente cambio válido.
 
-    Returns:
-        float: Sharpe Ratio (media de retornos / desviación estándar). 
-               Devuelve 0 si no hay operaciones o la std es cero.
+    - Incluye períodos en cash (retorno 0%).
+    - Mark-to-market diario cuando en posición.
+    - Costos solo en entry/exit.
+    - Asume long-only para trend_type='downtrend' (entrada en overshoot grande anticipando up).
+    - Devuelve Sharpe anualizado (sqrt(252)) o diario si annualize=False.
     """
 
     tracker = DCTracker(theta)
-    returns = []
+    equity = initial_capital
     position = False
-    buy_price = 0
-    for t in range(1, len(prices)):
-        p_current = prices.iloc[t]
+    entry_price = None
+    prev_equity = initial_capital
+    daily_returns = []
+
+    for t, p_current in enumerate(prices):
         tracker.update(t_current=t, p_current=p_current)
-        if value_type == 'osv':
-            val_cur = tracker.osv
-        else:
-            val_cur = tracker.tmv
-        if trend_type == 'dt' and tracker.trend == 'downtrend' and not position and val_cur >= candidate and t > tracker.t_dcc:
-            buy_price = p_current * (1 + operation_cost)
-            position = True
-        elif trend_type == 'ut' and tracker.trend == 'uptrend' and position and val_cur >= candidate and t > tracker.t_dcc:
-            sell_price = p_current * (1 - operation_cost)
-            ret = (sell_price - buy_price) / buy_price
-            returns.append(ret)
+        val_cur = tracker.osv if indicator == 'osv' else tracker.tmv
+        trend = tracker.trend
+
+        # Salida normal durante el período
+        if position and trend == 'uptrend' and val_cur >= candidates['uptrend']:
+            exit_price = p_current * (1 - operation_cost)
+            equity = equity * (exit_price / entry_price)
             position = False
+            entry_price = None
+
+        # Entrada
+        if not position and trend == 'downtrend' and val_cur >= candidates['downtrend']:
+            entry_price = p_current * (1 + operation_cost)
+            position = True
+
+        # Mark-to-market diario
+        if position:
+            units = equity / entry_price  # equity al momento de entrada
+            current_equity = units * p_current
+        else:
+            current_equity = equity
+
+        daily_ret = (current_equity - prev_equity) / prev_equity if prev_equity > 0 else 0.0
+        daily_returns.append(daily_ret)
+        prev_equity = current_equity
+
+    # === CIERRE FORZADO AL FINAL (si queda posición abierta) ===
     if position:
-        sell_price = prices.iloc[-1] * (1-operation_cost)
-        ret = (sell_price - buy_price) / buy_price
-        returns.append(ret)
-    if not returns:
-        return 0
-    mean_r = np.mean(returns)
-    std_r = np.std(returns) if len(returns) > 1 else 0.001
-    return mean_r / std_r if std_r > 0 else 0
+        final_price = prices.iloc[-1] * (1 - operation_cost)
+        units = equity / entry_price
+        final_equity = units * final_price
+        equity = final_equity  # actualizamos equity final correctamente
+        # Corregimos el último retorno diario
+        daily_returns[-1] = (final_equity - prev_equity) / prev_equity if prev_equity > 0 else 0.0
+
+    daily_returns = np.array(daily_returns)
+
+    if len(daily_returns) < 2 or np.std(daily_returns) <= 0:
+        return 0.0
+
+    sr_daily = np.mean(daily_returns) / np.std(daily_returns)
+    return sr_daily * np.sqrt(252) if annualize else sr_daily
 
 def medians_of_quartiles(array: np.ndarray) -> List[float]:
 
@@ -71,6 +127,10 @@ def medians_of_quartiles(array: np.ndarray) -> List[float]:
     median4 = np.median(group4)
 
     return [median1, median2, median3, median4]
+
+# ==================================================================================
+# CLASSES
+# ==================================================================================
 
 class StockDataLoader:
     def __init__(self, ticker: str):
@@ -100,8 +160,6 @@ class StockDataLoader:
         print(f"{self.ticker}: {len(df)} loaded days | {df['Date'].iloc[0].date()} to {df['Date'].iloc[-1].date()}")
 
 
-
-
 class DCTracker:
     """
         Tracks Directional Changes (DC)
@@ -129,8 +187,10 @@ class DCTracker:
         self.is_dcc = False
         self.os_length = 0
         
-        self.osv = None
-        self.tmv = None
+        self.os_length_old = 0
+
+        self.osv = 0
+        self.tmv = 0
 
         self.total_t_os = 0
         self.total_t_dc = 0
@@ -186,17 +246,18 @@ class DCTracker:
         self.is_dcc = True
 
         dc_duration_new = max(0, t_current - self.t_ext)
-        os_length_new = max(0, self.t_ext - self.t_dcc)     # corrige os_length
+        os_length_old = max(0, self.t_ext - self.t_dcc)     # corrige os_length
 
         self.total_t_dc += dc_duration_new
-        self.total_t_os += os_length_new
+        self.total_t_os += os_length_old
         self.n_dc += 1
-        self.n_os += 1 if os_length_new > 0 else 0
+        self.n_os += 1 if os_length_old > 0 else 0
 
-        self.if_os.append(os_length_new > 0)
+        self.if_os.append(os_length_old > 0)
         self.trend_history.append(self.trend)  # Trend que termina
 
         self.dc_duration = dc_duration_new
+        self.os_length_old = os_length_old
 
         # Cambio de trend
         self.trend = new_trend
@@ -208,9 +269,9 @@ class DCTracker:
         self.os_length = 0
 
     def __str__(self) -> str:
-        p_ext_str = f"{self.p_ext:.6f}" if self.p_ext is not None else "N/A"
-        p_dcc_star_str = f"{self.p_dcc_star:.6f}" if self.p_dcc_star is not None else "N/A"
-        p_init_str = f"{self.p_ext_initial:.6f}" if self.p_ext_initial is not None else "N/A"
+        p_ext_str = f"{self.p_ext:.3f}" if self.p_ext is not None else "N/A"
+        p_dcc_star_str = f"{self.p_dcc_star:.3f}" if self.p_dcc_star is not None else "N/A"
+        p_init_str = f"{self.p_ext_initial:.3f}" if self.p_ext_initial is not None else "N/A"
         t_ext_str = str(self.t_ext) if self.t_ext is not None else "N/A"
         t_dcc_str = str(self.t_dcc) if self.t_dcc is not None else "N/A"
 
@@ -226,8 +287,8 @@ class DCTracker:
             f"Current OS length: {self.os_length}",
             f"Last DC duration: {self.dc_duration}",
             f"Is DCC now?: {self.is_dcc}",
-            f"Current OSV: {self.osv}",
-            f"Current TMV: {self.tmv}",
+            f"Current OSV: {self.osv:.3f}",
+            f"Current TMV: {self.tmv:.3f}",
             "",
             "=== Statistics ===",
             f"DC events: {self.n_dc}",
@@ -318,71 +379,49 @@ class DCTrader:
                 tmv_list.append(tracker.tmv)
             
                 if tracker.is_dcc:
-                    os_days_mask.extend([True] * tracker.os_length) 
-                    os_days_mask.extend([True] * tracker.dc_duration) 
+                    os_days_mask.extend([True] * tracker.os_length_old) 
+                    os_days_mask.extend([False] * tracker.dc_duration) 
             
                 uptrend_mask.append(tracker.trend == 'uptrend')
             
+            last_os_days = len(uptrend_mask) - len(os_days_mask)
+            os_days_mask.extend([True] * last_os_days) 
+
             osv_array = np.array(osv_list)
             tmv_array = np.array(tmv_list)
             uptrend_array = np.array(uptrend_mask)
             os_days_array = np.array(os_days_mask)
             
-            dt_os_mask = os_days_array & ~uptrend_array  # os and not uptrend
-            ut_os_mask = os_days_array & uptrend_array   # os and uptrend
+            os_mask = {'downtrend': os_days_array & ~uptrend_array,     # os and not uptrend
+                       'uptrend': os_days_array & uptrend_array         # os and uptrend
+                       }
             
-            osv_array_dt = osv_array[dt_os_mask]
-            osv_array_ut = osv_array[ut_os_mask]
+            osv_dict = {}
+            tmv_dict = {}
+            osv_quart_med = {}
+            tmv_quart_med = {}
+            osv_best = {}
+            tmv_best = {}
+            for trend, mask in os_mask.items():
+                osv_dict[trend] = osv_array[mask]
+                tmv_dict[trend] = tmv_array[mask]
             
-            tmv_array_dt = tmv_array[dt_os_mask]
-            tmv_array_ut = tmv_array[ut_os_mask]
-            
-            # Defaults seguros
-            rd = 1
-            rn = 1
+                osv_quart_med[trend] = medians_of_quartiles(osv_dict[trend])
+                tmv_quart_med[trend] = medians_of_quartiles(tmv_dict[trend])
 
-            osv_dt_quart_med = medians_of_quartiles(osv_array_dt)
-            osv_ut_quart_med = medians_of_quartiles(osv_array_ut)
-            tmv_dt_quart_med = medians_of_quartiles(tmv_array_dt)
-            tmv_ut_quart_med = medians_of_quartiles(tmv_array_ut)
-
-            best_sr = -np.inf
-            for i, cand in enumerate(osv_dt_quart_med):
-                sr = compute_simple_sr(th, cand, self.prices, 'osv', 'dt')
-                if sr > best_sr:
-                    best_sr = sr
-                    osv_best_dt = cand
-            best_sr = -np.inf   
-            for i, cand in enumerate(osv_ut_quart_med):
-                sr = compute_simple_sr(th, cand, self.prices, 'osv', 'ut')
-                if sr > best_sr:
-                    best_sr = sr
-                    osv_best_ut = cand
-            best_sr = -np.inf
-            for i, cand in enumerate(tmv_dt_quart_med):
-                sr = compute_simple_sr(th, cand, self.prices, 'tmv', 'dt')
-                if sr > best_sr:
-                    best_sr = sr
-                    tmv_best_dt = cand
-            best_sr = -np.inf
-            for i, cand in enumerate(tmv_ut_quart_med):
-                sr = compute_simple_sr(th, cand, self.prices, 'tmv', 'ut')
-                if sr > best_sr:
-                    best_sr = sr
-                    tmv_best_ut = cand
+            osv_best = find_best_candidates(th, osv_quart_med, self.prices, 'osv')
+            tmv_best = find_best_candidates(th, tmv_quart_med, self.prices, 'tmv')          
 
             # rd y rn: ratios históricos promedio
-            if tracker.total_t_dc > 0:
-                rd = tracker.total_t_os / tracker.total_t_dc
-            if tracker.n_dc > 0:
-                rn = tracker.n_os / tracker.n_dc  # Probabilidad empírica de OS
+            rd = tracker.total_t_os / tracker.total_t_dc if tracker.total_t_dc > 0 else 1
+            rn = tracker.n_os / tracker.n_dc  if tracker.n_dc > 0 else 1
 
             # Crear estado simple
             state = type('State', (), {})()
-            state.osv_best_dt = osv_best_dt
-            state.osv_best_ut = osv_best_ut
-            state.tmv_best_dt = tmv_best_dt
-            state.tmv_best_ut = tmv_best_ut
+            state.osv_best_dt = osv_best['downtrend']
+            state.osv_best_ut = osv_best['uptrend']
+            state.tmv_best_dt = tmv_best['downtrend']
+            state.tmv_best_ut = tmv_best['uptrend']
             state.rd = rd
             state.rn = rn
 
