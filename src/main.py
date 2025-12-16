@@ -47,7 +47,7 @@ def compute_daily_sr(theta: float,
                      risk_free: float = 0.0,
                      operation_cost: float =0.0025,
                      initial_capital: float = 1.0,
-                     annualize: bool=True):
+                     annualize: bool=True) -> float:
     """
     Calcula Sharpe Ratio sobre retornos DIARIOS de la equity curve completa.
 
