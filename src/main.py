@@ -40,8 +40,14 @@ def find_best_candidates(threshold: List[float],
 
     return best_candidates
 
-def compute_daily_sr(theta, candidates, prices: pd.Series, indicator='osv',
-                     operation_cost=0.0025, initial_capital=1.0, annualize=True):
+def compute_daily_sr(theta: float, 
+                     candidates: Dict[str, list[float]],
+                     prices: pd.Series, 
+                     indicator: str = 'osv',
+                     risk_free: float = 0.0,
+                     operation_cost: float =0.0025,
+                     initial_capital: float = 1.0,
+                     annualize: bool=True):
     """
     Calcula Sharpe Ratio sobre retornos DIARIOS de la equity curve completa.
 
@@ -67,17 +73,17 @@ def compute_daily_sr(theta, candidates, prices: pd.Series, indicator='osv',
         val_cur = tracker.osv if indicator == 'osv' else tracker.tmv
         trend = tracker.trend
 
+        # Entrada
+        if not position and trend == 'downtrend' and val_cur >= candidates['downtrend']:
+            entry_price = p_current * (1 + operation_cost)
+            position = True
+
         # Salida normal durante el período
         if position and trend == 'uptrend' and val_cur >= candidates['uptrend']:
             exit_price = p_current * (1 - operation_cost)
             equity = equity * (exit_price / entry_price)
             position = False
             entry_price = None
-
-        # Entrada
-        if not position and trend == 'downtrend' and val_cur >= candidates['downtrend']:
-            entry_price = p_current * (1 + operation_cost)
-            position = True
 
         # Mark-to-market diario
         if position:
@@ -101,10 +107,11 @@ def compute_daily_sr(theta, candidates, prices: pd.Series, indicator='osv',
 
     daily_returns = np.array(daily_returns)
 
-    if len(daily_returns) < 2 or np.std(daily_returns) <= 0:
+    std_daily = np.std(daily_returns, ddof=1)
+    if std_daily <= 0:
         return 0.0
+    sr_daily = (np.mean(daily_returns) - risk_free) / std_daily
 
-    sr_daily = np.mean(daily_returns) / np.std(daily_returns)
     return sr_daily * np.sqrt(252) if annualize else sr_daily
 
 def medians_of_quartiles(array: np.ndarray) -> List[float]:
