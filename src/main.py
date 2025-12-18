@@ -1,14 +1,11 @@
-import os
 import numpy as np
 from pathlib import Path
 import pandas as pd
 import pickle
 import matplotlib.pyplot as plt
-from typing import List, Dict, Any, Optional, Union
-from trainer import GATrainer
 from strategies import StrategyBase
-
-from typing import List, Union, Dict, Any, Tuple, Optional 
+from typing import List, Dict, Any, Tuple, Optional, Type, Sequence
+from dataclasses import dataclass
 
 # ==================================================================================
 # UTILS
@@ -135,6 +132,32 @@ def medians_of_quartiles(array: np.ndarray) -> List[float]:
 
     return [median1, median2, median3, median4]
 
+
+@dataclass(frozen=True)
+class BestCandidates:
+    """Precomputed best candidates for OSV and TMV in uptrend and downtrend."""
+    osv_best_dt: float
+    osv_best_ut: float
+    tmv_best_dt: float
+    tmv_best_ut: float
+    rd: float
+    rn: float
+
+    def osv_best(self, trend) -> float:
+        return self.osv_best_dt if trend == 'downtrend' else self.osv_best_ut
+
+    def tmv_best(self, trend) -> float:
+        return self.tmv_best_dt if trend == 'downtrend' else self.tmv_best_ut
+
+
+# ==================================================================================
+# DEFAULT PARAMETERS
+# ==================================================================================
+
+DEFAULT_THRESHOLDS = [0.00098, 0.0022, 0.0048, 0.0072, 0.0098, 0.0122, 0.0155, 0.017, 0.02, 0.0255]
+from strategies import St1, St2, St3, St4, St5, St6, St7, St8
+DEFAULT_STRATEGIES: List[Type[StrategyBase]] = [St1, St2, St3, St4, St5, St6, St7, St8]
+
 # ==================================================================================
 # CLASSES
 # ==================================================================================
@@ -169,111 +192,206 @@ class StockDataLoader:
 
 class DCTracker:
     """
-        Tracks Directional Changes (DC)
+    Tracks Directional Changes (DC)
 
-        Detects uptrends (UT), downtrends (DT), DC events, and overshoots (OS) using threshold theta.
-        Calculates OSV (Overshoot Value) and TMV (Total Movement Value).
+    Detects uptrends (UT), downtrends (DT), DC events, and overshoots (OS) using threshold theta.
+    Calculates OSV (Overshoot Value) and TMV (Total Movement Value).
 
-        Usage:
-            tracker = DCTracker(theta, p0, t0=0)
-            for t, p in data:
-                tracker.update(t, p)
-        """
+    Usage:
+        tracker = DCTracker(theta, memory=5)
+        for t, p in enumerate(prices):
+            tracker.update(t, p)
+    """
+
     def __init__(self, theta: float, memory: int = 5):
         """
-        Init with theta, initial price p0, time t0
+        Init with theta and optional memory for trend/if_os history.
+
+        Parameters:
+            theta (float): Directional change threshold (e.g., 0.01 for 1%).
+            memory (int): Number of recent trends and OS flags to keep.
         """
+        if theta <= 0:
+            raise ValueError("theta must be positive")
+
         self.theta = theta
-        self.trend = None  # None hasta primer precio
-        self.p_ext = None
-        self.t_ext = None
-        self.p_dcc_star = None
-        self.p_ext_initial = None
-        self.t_dcc = None
-        self.dc_duration = 0
-        self.is_dcc = False
-        self.os_length = 0
-        
-        self.os_length_old = 0
-
-        self.osv = 0
-        self.tmv = 0
-
-        self.total_t_os = 0
-        self.total_t_dc = 0
-        self.n_os = 0
-        self.n_dc = 0
-
-        self.trend_history: List[str] = []
-        self.if_os: List[bool] = []
         self.memory = memory
+
+        # Estado interno (inmutable en lo posible después de inicialización)
+        self._trend: Optional[str] = None
+        self._p_ext: Optional[float] = None
+        self._t_ext: Optional[int] = None
+        self._p_dcc_star: Optional[float] = None
+        self._p_ext_initial: Optional[float] = None
+        self._t_dcc: Optional[int] = None
+        self._dc_duration: int = 0
+        self._is_dcc: bool = False
+        self._os_length: int = 0
+        self._os_length_old: int = 0
+
+        # Estadísticas acumuladas
+        self.total_t_os: int = 0
+        self.total_t_dc: int = 0
+        self.n_os: int = 0
+        self.n_dc: int = 0
+
+        # Historia reciente (limitada por memory)
+        self._trend_history: List[str] = []
+        self._if_os: List[bool] = []
+
+    @property
+    def trend(self) -> Optional[str]:
+        return self._trend
+
+    @property
+    def p_ext(self) -> Optional[float]:
+        return self._p_ext
+
+    @property
+    def t_ext(self) -> Optional[int]:
+        return self._t_ext
+
+    @property
+    def p_dcc_star(self) -> Optional[float]:
+        return self._p_dcc_star
+
+    @property
+    def p_ext_initial(self) -> Optional[float]:
+        return self._p_ext_initial
+
+    @property
+    def t_dcc(self) -> Optional[int]:
+        return self._t_dcc
+
+    @property
+    def dc_duration(self) -> int:
+        return self._dc_duration
+
+    @property
+    def is_dcc(self) -> bool:
+        return self._is_dcc
+
+    @property
+    def os_length(self) -> int:
+        return self._os_length
+
+    @property
+    def os_length_old(self) -> int:
+        return self._os_length_old
+
+    @property
+    def trend_history(self) -> List[str]:
+        return self._trend_history.copy()  # Devuelve copia para inmutabilidad externa
+
+    @property
+    def if_os(self) -> List[bool]:
+        return self._if_os.copy()
+
+    @property
+    def osv(self) -> float:
+        """Overshoot Value actual"""
+        if self._p_dcc_star is None or self._p_dcc_star == 0:
+            return 0.0
+        current_price = self._current_price  # Usamos el precio actual (como en original)
+        if current_price is None:
+            return 0.0
+        return abs(current_price - self._p_dcc_star) / (self.theta * self._p_dcc_star)
+
+    @property
+    def tmv(self) -> float:
+        """Total Movement Value actual"""
+        if self._p_ext_initial is None or self._p_ext_initial == 0:
+            return 0.0
+        current_price = self._current_price  # Usamos el precio actual (como en original)
+        if current_price is None:
+            return 0.0
+        return abs(current_price - self._p_ext_initial) / (self.theta * self._p_ext_initial)
 
     def update(self, t_current: int, p_current: float):
         """
         Process new time/price; detect DC, update stats.
         """
-        if self.trend is None:  # Primer precio → inicializar
-            self.trend = 'downtrend'
-            self.p_ext = p_current
-            self.t_ext = t_current
-            self.p_dcc_star = p_current * (1 + self.theta)
-            self.p_ext_initial = p_current
-            self.t_dcc = t_current
-            self.is_dcc = False
+        self._current_price = p_current  # Guardamos el precio actual para cálculos
+
+        if self._trend is None:  # Primer precio → inicializar
+            self._initialize_first_point(t_current, p_current)
             return
 
-        self.is_dcc = False
-        
-        self.os_length += 1 # actualiza siempre, corrige en _confirm_dc si es necesario
-        
-        if self.trend == 'downtrend':
-            if p_current < self.p_ext:  # Actualiza low → OS phase
-                self.p_ext = p_current
-                self.t_ext = t_current
-            if p_current >= self.p_ext * (1 + self.theta):
+        self._is_dcc = False
+        self._os_length += 1  # Se incrementa siempre, se corrige en confirm_dc si procede
+
+        if self._trend == 'downtrend':
+            if p_current < self._p_ext:  # Nuevo low → fase OS
+                self._p_ext = p_current
+                self._t_ext = t_current
+
+            if p_current >= self._p_ext * (1 + self.theta):
                 self._confirm_dc(t_current, p_current, 'uptrend')
 
         else:  # uptrend
-            if p_current > self.p_ext:  # Actualiza high → OS phase
-                self.p_ext = p_current
-                self.t_ext = t_current
-            if p_current <= self.p_ext * (1 - self.theta):
+            if p_current > self._p_ext:  # Nuevo high → fase OS
+                self._p_ext = p_current
+                self._t_ext = t_current
+
+            if p_current <= self._p_ext * (1 - self.theta):
                 self._confirm_dc(t_current, p_current, 'downtrend')
 
-        # OSV y TMV
-        self.osv = abs(p_current - self.p_dcc_star) / (self.theta * self.p_dcc_star) if self.p_dcc_star else 0.0
-        self.tmv = abs(p_current - self.p_ext_initial) / (self.theta * self.p_ext_initial) if self.p_ext_initial else 0.0
+        # Las propiedades osv y tmv se calculan on-demand usando p_current
 
-        # Trim history
-        if len(self.trend_history) > self.memory:
-            self.trend_history = self.trend_history[-self.memory:]
-            self.if_os = self.if_os[-self.memory:]
+        # Mantener historia limitada
+        if len(self._trend_history) > self.memory:
+            self._trend_history = self._trend_history[-self.memory:]
+            self._if_os = self._if_os[-self.memory:]
+
+    def _initialize_first_point(self, t_current: int, p_current: float):
+        """Inicialización limpia para el primer punto de precio."""
+        self._trend = 'downtrend'
+        self._p_ext = p_current
+        self._t_ext = t_current
+        self._p_dcc_star = p_current * (1 + self.theta)
+        self._p_ext_initial = p_current
+        self._t_dcc = t_current
+        self._os_length = 0
+        self._is_dcc = False
 
     def _confirm_dc(self, t_current: int, p_current: float, new_trend: str):
-        self.is_dcc = True
+        """Confirma un Directional Change y actualiza todo el estado."""
+        self._is_dcc = True
 
-        dc_duration_new = max(0, t_current - self.t_ext)
-        os_length_old = max(0, self.t_ext - self.t_dcc)     # corrige os_length
+        dc_duration_new = max(0, t_current - self._t_ext)
+        os_length_old = max(0, self._t_ext - self._t_dcc)
 
         self.total_t_dc += dc_duration_new
         self.total_t_os += os_length_old
         self.n_dc += 1
         self.n_os += 1 if os_length_old > 0 else 0
 
-        self.if_os.append(os_length_old > 0)
-        self.trend_history.append(self.trend)  # Trend que termina
+        # Guardar historia del trend que termina
+        self._trend_history.append(self._trend)
+        self._if_os.append(os_length_old > 0)
 
-        self.dc_duration = dc_duration_new
-        self.os_length_old = os_length_old
+        self._dc_duration = dc_duration_new
+        self._os_length_old = os_length_old
 
         # Cambio de trend
-        self.trend = new_trend
-        self.p_ext_initial = self.p_ext
-        self.p_ext = p_current
-        self.p_dcc_star = self.p_ext_initial * (1 + self.theta) if new_trend == 'uptrend' else self.p_ext_initial * (1 - self.theta)
-        self.t_ext = t_current
-        self.t_dcc = t_current
-        self.os_length = 0
+        self._trend = new_trend
+        self._p_ext_initial = self._p_ext
+        self._p_ext = p_current
+        self._p_dcc_star = (
+            self._p_ext_initial * (1 + self.theta)
+            if new_trend == 'uptrend'
+            else self._p_ext_initial * (1 - self.theta)
+        )
+        self._t_ext = t_current
+        self._t_dcc = t_current
+        self._os_length = 0
+
+    def load_best_candidates(self, BestCandidates: BestCandidates):
+        """Return best precomputed OSV & TMV depending on current trend."""
+        self.osv_best = BestCandidates.osv_best(self.trend)
+        self.tmv_best = BestCandidates.tmv_best(self.trend)
+        self.rd = BestCandidates.rd
+        self.rn = BestCandidates.rn
 
     def __str__(self) -> str:
         p_ext_str = f"{self.p_ext:.3f}" if self.p_ext is not None else "N/A"
@@ -305,670 +423,708 @@ class DCTracker:
             "",
             f"Recent trends: {self.trend_history}",
             f"Recent OS flags: {self.if_os}",
-            "============================="
+            "=============================",
         ]
         return "\n".join(lines)
 
-class DCTrader:
-    def __init__(self, 
-                 ticker: str, 
-                 thresholds: List[float] = None,
-                 strategies: List[StrategyBase] = None,
-                 is_train: bool = False,
-                 start_date: Optional[str] = None, 
-                 end_date: Optional[str] = None,
-                 operation_cost: float = 0.0025,
-                 ):
+
+class DCFeatureExtractor:
+    """
+    Precompute all signals (actions: 0=hold, 1=buy, 2=sell) from the strategies
+    for each threshold and each day in the price history.
+    """
+
+    def __init__(
+        self,
+        prices: pd.Series,
+        thresholds: Optional[List[float]] = None,
+        strategies: Optional[List[Type[StrategyBase]]] = None,
+        memory: int = 5,
+        is_train: bool = False,
+        ):
         
-        self.ticker = ticker
+        self.prices = np.asarray(prices.values, dtype=np.float64)
+        self.n_days = len(self.prices)
+        self.thresholds = thresholds if thresholds is not None else DEFAULT_THRESHOLDS
+        self.strategies = strategies if strategies is not None else DEFAULT_STRATEGIES
+        self.memory = memory
+        self.is_train = is_train
+        
+        self.n_ths = len(self.thresholds)
+        self.n_strats = len(self.strategies)
+
+        self.best_cand_list: List[BestCandidates] = []
+
+        # Precomputaciones
+        self._precompute_states()
+        
+        self.signals = {
+            False: np.zeros((self.n_days, self.n_ths, self.n_strats), dtype=np.int8),
+            True: np.zeros((self.n_days, self.n_ths, self.n_strats), dtype=np.int8)
+        }
+        self._precompute_signals()
+
+        print("Precomputation of signals completed.")
+
+    def _precompute_states(self) -> None:
+        """Precomputa osv_best, tmv_best, rd, rn por cada threshold."""
+        self.best_cand_list = []
+
+        for th_idx, th in enumerate(self.thresholds):
+            if self.is_train:
+                tracker = DCTracker(th)
+
+                osv_list: List[float] = []
+                tmv_list: List[float] = []
+                os_days_mask: List[bool] = []
+                uptrend_mask: List[bool] = []
+
+                for t_current, p_current in enumerate(self.prices):
+                    tracker.update(t_current=t_current, p_current=p_current)
+
+                    osv_list.append(tracker.osv)
+                    tmv_list.append(tracker.tmv)
+                    uptrend_mask.append(tracker.trend == 'uptrend')
+
+                    if tracker.is_dcc:
+                        os_days_mask.extend([True] * tracker.os_length_old)
+                        os_days_mask.extend([False] * tracker.dc_duration)
+
+                # Completar máscara OS para días finales
+                remaining = len(self.prices) - len(os_days_mask)
+                os_days_mask.extend([True] * remaining)
+
+                osv_array = np.array(osv_list)
+                tmv_array = np.array(tmv_list)
+                uptrend_array = np.array(uptrend_mask)
+                os_days_array = np.array(os_days_mask)
+
+                os_mask = {
+                    'downtrend': os_days_array & ~uptrend_array,
+                    'uptrend': os_days_array & uptrend_array
+                }
+
+                osv_quart_med = {}
+                tmv_quart_med = {}
+
+                for trend, mask in os_mask.items():
+                    if np.any(mask):
+                        osv_quart_med[trend] = medians_of_quartiles(osv_array[mask])
+                        tmv_quart_med[trend] = medians_of_quartiles(tmv_array[mask])
+                    else:
+                        osv_quart_med[trend] = []
+                        tmv_quart_med[trend] = []
+
+                osv_best = find_best_candidates(th, osv_quart_med, pd.Series(self.prices), 'osv')
+                tmv_best = find_best_candidates(th, tmv_quart_med, pd.Series(self.prices), 'tmv')
+
+                rd = tracker.total_t_os / tracker.total_t_dc if tracker.total_t_dc > 0 else 1.0
+                rn = tracker.n_os / tracker.n_dc if tracker.n_dc > 0 else 1.0
+            else:
+                # Valores por defecto para test
+                osv_best = {'downtrend': 0.0, 'uptrend': 1.0}
+                tmv_best = {'downtrend': 0.0, 'uptrend': 1.0}
+                rd = 1.0
+                rn = 1.0
+                
+            state = BestCandidates(
+                osv_best_dt=osv_best['downtrend'],
+                osv_best_ut=osv_best['uptrend'],
+                tmv_best_dt=tmv_best['downtrend'],
+                tmv_best_ut=tmv_best['uptrend'],
+                rd=rd,
+                rn=rn,
+            )
+
+            self.best_cand_list.append(state)
+
+    def _precompute_signals(self):
+        for th_idx, theta in enumerate(self.thresholds):
+            tracker = DCTracker(theta=theta, memory=self.memory)
+            best_by_theta = self.best_cand_list[th_idx]
+
+            for t in range(self.n_days):
+                p_current = self.prices[t]
+                tracker.update(t_current=t, p_current=p_current)
+                tracker.load_best_candidates(best_by_theta)
+                
+                for s_idx, StrategyClass in enumerate(self.strategies):
+                    # Without position
+                    inst_no = StrategyClass(t, p_current, position=False, state=tracker)
+                    self.signals[False][t, th_idx, s_idx] = inst_no.recommendation
+                    
+                    # With position
+                    inst_with = StrategyClass(t, p_current, position=True, state=tracker)
+                    self.signals[True][t, th_idx, s_idx] = inst_with.recommendation
+
+    # === Métodos de acceso ===
+    def get_signals_day(self, day_idx: int, position: bool) -> np.ndarray:
+        return self.signals[position][day_idx]
+
+    def get_signals_threshold(self, th_idx: int) -> np.ndarray:
+        return self.signals[:, th_idx, :]
+
+    def get_action(self, day_idx: int, th_idx: int, strategy_idx: int, position: bool) -> int:
+        return self.signals[position][day_idx, th_idx, strategy_idx]
+
+    def __getitem__(self, key, position: bool):
+        if isinstance(key, tuple) and len(key) == 3:
+            t, th, s = key
+            return self.signals[position][t, th, s]
+        elif isinstance(key, int):
+            return self.get_signals_day(key, position)
+        else:
+            raise IndexError("Valid indices: extractor[t] or extractor[t, th, s]")
+
+class DCEnsembleModel:
+    """
+    Ensemble model that combines signals from multiple strategies and thresholds
+    using a normalized weight matrix per strategy.
+
+    - Weights: matrix of shape (n_strats, n_ths)
+    - Normalization: row-wise (each strategy distributes its "vote" across its thresholds)
+    - Prediction: weighted vote → action with the highest accumulated weight (0, 1, or 2)
+    """
+
+    def __init__(
+        self,
+        n_strats: int,
+        n_ths: int,
+        combination_matrix: List[Tuple[int, int]] = None
+    ):
+        """
+        Parameters:
+            n_strats: Number of strategies used (must match extractor.n_strats)
+            n_ths: Number of thresholds used (must match extractor.n_ths)
+            combination_matrix: List of tuples (strategy_idx, threshold_idx) indicating
+                                which combinations have trainable weights.
+                                If None, all possible combinations are used.
+        """
+        self.n_strats = n_strats
+        self.n_ths = n_ths
+
+        # We define which combinations (strategy, threshold) have trainable weights
+        if combination_matrix is None:
+            # By default: combinations recommended by paper
+            combination_matrix = []
+            for s_idx in range(self.n_strats):
+                max_th = self.n_ths if s_idx < 6 else min(5, self.n_ths)
+                for th_idx in range(max_th):
+                    combination_matrix.append((s_idx, th_idx))
+        self.combination_matrix = combination_matrix
+
+        self.n_weights = len(self.combination_matrix)
+
+        # Matriz de pesos: (n_strats, n_ths) → inicializada en cero
+        self.weights = np.zeros((n_strats, n_ths), dtype=np.float32)
+
+        print(f"DCEnsembleModel initialized:")  
+        print(f"  - Strategies: {n_strats}")
+        print(f"  - Thresholds: {n_ths}")
+        print(f"  - Trainable weights: {self.n_weights} (of {n_strats * n_ths} possible)")
+
+    def set_flat_weights(self, flat_weights: List[float] | np.ndarray):
+        """
+        Assigns weights from a flat vector (typical output from GA/PSO).
+        Normalizes row-wise (per strategy).
+        """
+        if len(flat_weights) != self.n_weights:
+            raise ValueError(f"Expected {self.n_weights} weights, received {len(flat_weights)}")
+
+        # Reinit matrix
+        self.weights.fill(0.0)
+
+        # Assign weights according to combination_matrix
+        flat_weights = np.asarray(flat_weights, dtype=np.float32)
+        
+        for (s_idx, th_idx), w in zip(self.combination_matrix, flat_weights):
+            self.weights[s_idx, th_idx] = w
+
+        # # Normalization weight between 0 and 1
+        # self.weights = (self.weights + 1) / 2
+        # # Normalization by threshold (column-wise)
+        # col_sums = self.weights.sum(axis=0, keepdims=True)
+        # # Avoid division by zero
+        # col_sums[col_sums == 0] = 1.0
+        # self.weights = self.weights / col_sums
+
+    def predict_day(self, signals_day: np.ndarray) -> int:
+        """
+        Predicts the action for a specific day given its precomputed signals.
+        
+        signals_day: array of shape (n_ths, n_strats) → signals from the extractor for that day
+        Returns: 0 (hold), 1 (buy), or 2 (sell)
+        """
+        if signals_day.shape != (self.n_ths, self.n_strats):
+            raise ValueError(f"Expected shape: ({self.n_ths}, {self.n_strats}), "
+                            f"received: {signals_day.shape}")
+
+        # Transpose in order to get (n_strats, n_ths)
+        signals_transposed = signals_day.T  # shape: (n_strats, n_ths)
+
+        # Weighted votes: each signal multiplied by its corresponding weight
+        weighted_votes = signals_transposed * self.weights  # shape: (n_strats, n_ths)
+
+        # Accumulate total votes per action (0: hold, 1: buy, 2: sell)
+        total_votes = np.zeros(3, dtype=np.float32)
+        for action in range(3):
+            total_votes[action] = weighted_votes[signals_transposed == action].sum()
+
+        # Count how many signals (independently of the weight) are different from hold
+        n_non_hold_signals = np.sum(signals_day != 0)  # each element is a signal (th, strat)
+
+        # Additional rule: if there are N or more signals different from hold → discard hold
+        # N = 2
+        # if n_non_hold_signals >= N:
+        #     # Put the hold vote to -inf so it never wins
+        #     total_votes[0] = -np.inf
+
+        # Action with highest accumulated vote
+        return int(np.argmax(total_votes))
+
+    def predict_all(self, extractor, initial_position: bool = False) -> np.ndarray:
+        """
+        Predicts actions for all historical days.
+        Returns array of shape (n_days,) with actions 0,1,2
+        """
+        if extractor.n_ths != self.n_ths or extractor.n_strats != self.n_strats:
+            raise ValueError("The extractor does not match the model dimensions")
+        
+        position = initial_position
+        predictions = np.zeros(extractor.n_days, dtype=np.int8)
+        for t in range(extractor.n_days):
+            signals_day = extractor.get_signals_day(t, position)  # (n_ths, n_strats)
+            predictions[t] = self.predict_day(signals_day)
+            if position and predictions[t] == 2:
+                position = False
+            elif not position and predictions[t] == 1:
+                position = True
+                
+        return predictions
+
+    # === Utilities for load/save model ===
+    def save(self, path):
+        raise NotImplementedError("Use DCTrader.save_model() instead")
+    
+    @classmethod
+    def load(cls, path):
+        raise NotImplementedError("Use DCTrader.load_model() instead")
+
+    def summary(self) -> Dict[str, Any]:
+        active_weights = np.sum(self.weights > 0)
+        return {
+            'n_strategies': self.n_strats,
+            'n_thresholds': self.n_ths,
+            'n_trainable_weights': self.n_weights,
+            'active_weights (>0)': int(active_weights),
+            'total_possible_weights': self.n_strats * self.n_ths,
+            'sparsity': 1 - active_weights / (self.n_strats * self.n_ths)
+        }
+
+class DCBacktester:
+    """
+    Efficient backtesting engine for the DC Ensemble system.
+    
+    Uses the daily predictions from the DCEnsembleModel (0=hold, 1=buy, 2=sell)
+    to simulate trading with transaction costs and compute performance metrics.
+    """
+
+    def __init__(
+        self,
+        prices: pd.Series,                     # Serie de precios Close (index: fechas)
+        dates: pd.Index,                       # Fechas correspondientes
+        model_predictions: np.ndarray,         # Array (n_days,) con acciones 0,1,2
+        buy_cost: float = 0.0025,              # Costo de compra (ej: 0.25%)
+        sell_cost: float = 0.0025,             # Costo de venta
+        initial_capital: float = 1.0           # Capital inicial normalizado
+    ):
+        self.prices = np.asarray(prices.values, dtype=np.float64)
+        self.dates = dates
+        self.predictions = np.asarray(model_predictions, dtype=np.int8)
+        self.buy_factor = 1.0 + buy_cost
+        self.sell_factor = 1.0 - sell_cost
+        self.initial_capital = initial_capital
+
+        if len(self.prices) != len(self.predictions):
+            raise ValueError("prices and predictions must have the same length")
+        if len(self.prices) != len(self.dates):
+            raise ValueError("prices and dates must have the same length")
+
+        self.n_days = len(self.prices)
+
+    def run(self) -> Dict[str, Any]:
+        """
+        Runs the full backtest and returns metrics + equity curve.
+        """
+        position = False          
+        entry_price = 0.0        
+        equity = self.initial_capital
+        equity_curve = np.full(self.n_days, self.initial_capital, dtype=np.float64)
+        daily_returns = np.zeros(self.n_days, dtype=np.float64)
+        trades = 0
+
+        for t in range(self.n_days):
+            action = self.predictions[t]
+            # print(f"Day {t+1}/{self.n_days} | Price: {self.prices[t]:.2f} | Action: {action} | Position: {position} | Equity: {equity:.5f}")
+            price = self.prices[t]
+
+            # === Execution of signals ===
+            if action == 1 and not position:  # BUY
+                entry_price = price * self.buy_factor
+                position = True
+                # trades += 1   
+
+            elif action == 2 and position:  # SELL
+                exit_price = price * self.sell_factor
+                ret = (exit_price / entry_price) - 1.0
+                equity *= (1.0 + ret)
+                position = False
+                trades += 1
+
+            # === Mark-to-market daily if we are in a position ===
+            if position:
+                current_value = equity * (price / (entry_price / self.buy_factor))
+                equity_curve[t] = current_value
+            else:
+                equity_curve[t] = equity
+
+            # Daily return
+            if t > 0:
+                daily_returns[t] = equity_curve[t] / equity_curve[t-1] - 1.0
+
+        # === Forced close at the end if there is an open position ===
+        if position:
+            final_price = self.prices[-1] * self.sell_factor
+            ret = (final_price / entry_price) - 1.0
+            equity *= (1.0 + ret)
+            equity_curve[-1] = equity
+            trades += 1
+
+        # === Calculation of metrics ===
+        total_return = equity_curve[-1] / self.initial_capital - 1.0
+        annualized_return = (1 + total_return) ** (252 / self.n_days) - 1 if self.n_days > 0 else 0.0
+
+        daily_returns = np.diff(equity_curve) / equity_curve[:-1] if self.n_days > 1 else np.array([0.0])
+        std_daily = np.std(daily_returns) if len(daily_returns) > 1 else 0.0
+        sharpe_ratio = (np.mean(daily_returns) * 252**0.5) / std_daily if std_daily > 0 else 0.0
+
+        turnover = trades / self.n_days if self.n_days > 0 else 0.0
+
+        # VaR al 5%
+        var_5 = np.percentile(daily_returns, 5) if len(daily_returns) > 0 else 0.0
+
+        metrics = {
+            'RoR': round(total_return, 5),
+            'Annualized_RoR': round(annualized_return, 5),
+            'SR': round(sharpe_ratio, 4),
+            'STD_daily': round(std_daily, 6),
+            'VaR_5%': round(var_5, 5),
+            'ToR': round(turnover, 6),
+            'Trades': trades,
+            'Final_Equity': round(equity, 5),
+            'n_days': self.n_days
+        }
+        
+        
+        bh_return = self.prices / self.prices[0] - 1.0      # Buy & Hold return
+
+        # Equity curve as DataFrame
+        equity_df = pd.DataFrame({
+            'date': self.dates,
+            'equity': equity_curve,
+            'cumulative_return': equity_curve / self.initial_capital - 1.0,
+            'bh_return': bh_return
+        }).set_index('date')
+
+        return {
+            **metrics,
+            'equity_curve': equity_df,
+            'daily_returns': daily_returns
+        }
+    def plot_equity(
+        self,
+        title: str = "Equity Curve - DC Ensemble Strategy",
+        figsize: tuple = (14, 8),
+        show_buy_and_hold: bool = True,
+        show: bool = True
+    ):
+        """
+        Plotea la curva de equity de la estrategia y, opcionalmente,
+        la comparación con Buy & Hold, todo en un único eje Y (misma escala).
+        """
+        results = self.run()  # Asegura que los resultados estén calculados
+        df = results['equity_curve']
+        metrics = results
+
+        # Buy & Hold: retorno acumulado normalizado al mismo capital inicial
+        bh_return = self.prices / self.prices[0] - 1.0
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # Estrategia
+        color_strat = 'tab:blue'
+        ax.plot(df.index, df['cumulative_return'], 
+                label='MSTGAM', color=color_strat, linewidth=2.5)
+
+        # Buy & Hold (opcional)
+        if show_buy_and_hold:
+            color_bh = 'tab:orange'
+            ax.plot(df.index, bh_return, 
+                    label='Buy & Hold', color=color_bh, linewidth=2, alpha=0.85, linestyle='--')
+
+        # Configuración del eje
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Cumulative Return')
+        ax.grid(True, alpha=0.3)
+        ax.set_title(title)
+
+        # Métricas en el gráfico
+        strategy_final = df['cumulative_return'].iloc[-1]
+        bh_final = bh_return[-1] if len(bh_return) > 0 else 0.0
+
+        text = (
+            f"MSTGAM RoR: {strategy_final:.2%} | SR: {metrics['SR']:.3f} | Trades: {metrics['Trades']}\n"
+            f"Buy & Hold RoR: {bh_final:.2%}"
+        )
+        ax.text(0.02, 0.98, text, transform=ax.transAxes,
+                bbox=dict(facecolor='white', alpha=0.95, edgecolor='gray'),
+                verticalalignment='top', fontsize=11)
+
+        # Leyenda
+        ax.legend(loc='upper right')
+
+        fig.tight_layout()
+        if show:
+            plt.show()
+        
+    @classmethod
+    def from_model_and_extractor(
+        cls,
+        prices: pd.Series,
+        extractor,
+        model,
+        initial_position: bool = False,
+        **kwargs
+    ):
+        """
+        Alternative Constructor: creates the backtester directly from the model and extractor.
+        """
+        predictions = model.predict_all(extractor, initial_position)
+        return cls(
+            prices=prices,
+            dates=prices.index,
+            model_predictions=predictions,
+            **kwargs
+        )
+
+
+class DCTrader:
+    """
+    High-level class that orchestrates the entire trading pipeline based on Directional Changes
+    with optimized ensemble.
+
+    Typical flow:
+        trader = DCTrader('AAPL')
+        trader.train(method='GA', pop_size=100, n_gen=50)
+        results = trader.backtest()
+        trader.plot_equity()
+        trader.save_model('aapl_best_model.pkl')
+    """
+
+    def __init__(
+        self,
+        ticker: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        thresholds: Optional[List[float]] = None,
+        strategies: Optional[List[Any]] = None,     # Clases de estrategias
+        is_train: bool = False,
+        buy_cost: float = 0.0025,
+        sell_cost: float = 0.0025,
+    ):
+        self.ticker = ticker.upper()
+        self.buy_cost = buy_cost
+        self.sell_cost = sell_cost
+
+        print(f"Loading data for {self.ticker}...")
+
+        # === Data loader ===
         self.stock = StockDataLoader(ticker)
         self.stock.load_data(start_date, end_date)
         self.prices = self.stock.data['Close']
         self.dates = self.stock.data['Date']
 
-        if not thresholds:
-            thresholds = [0.00098, 0.0022, 0.0048, 0.0072, 0.0098, 0.0122, 0.0155, 0.017, 0.02, 0.0255]
-            print('Default thresholds loaded')
+        # === Signal extractor instance ===
+        self.extractor = DCFeatureExtractor(
+            prices=self.prices,
+            thresholds=thresholds,
+            strategies=strategies,
+            is_train = is_train,
+        )
 
-        if not strategies:
-            from strategies import St1, St2, St3, St4, St5, St6, St7, St8
-            strategies = [St1, St2, St3, St4, St5, St6, St7, St8]
-            print('Default strategies loaded')       
+        # === Ensemble model creation ===
+        self.model = DCEnsembleModel(
+            n_strats=self.extractor.n_strats,
+            n_ths=self.extractor.n_ths
+        )
 
-        self.thresholds = sorted(thresholds)                        # Ensure ordered
-        self.states_list = None
-        self.strategies = strategies
-        self.n_strats = len(self.strategies)                        # Number of strategies
-        self.n_ths = len(self.thresholds)                           # Number of thresholds
-        self.trackers: Dict[float, DCTracker] = {
-            th: DCTracker(th) for th in self.thresholds
-        }
-        self.states = self._precompute_states() if is_train else None
-        self.position = False
+        # Backtester instance under demand
+        self.backtester: Optional[DCBacktester] = None
+        self.last_results: Optional[Dict[str, Any]] = None
 
-        self.operation_cost = operation_cost
-        self.buy_cost_factor = 1 + self.operation_cost
-        self.sell_cost_factor = 1 - self.operation_cost
+    def backtest(self, initial_position: bool = False) -> Dict[str, Any]:
+        """Run backtest with current model weights"""
+        print("Running backtest...")
+        self.backtester = DCBacktester.from_model_and_extractor(
+            prices=self.prices,
+            extractor=self.extractor,
+            model=self.model,
+            initial_position=initial_position,
+            buy_cost=self.buy_cost,
+            sell_cost=self.sell_cost
+        )
+        self.last_results = self.backtester.run()
+        print(f"Backtest completed → RoR: {self.last_results['RoR']:.2%} | "
+              f"SR: {self.last_results['SR']:.3f} | Trades: {self.last_results['Trades']}")
+        return self.last_results
 
-        self.combination_matrix = self._get_combination_matrix()
-        self.weights: Optional[np.ndarray] = None
+    def plot_equity(self, title: str = None, figsize=(14, 8), show_buy_and_hold: bool = True):
+        if self.last_results is None:
+            print("Running backtest first...")
+            self.backtest()
 
-    def _get_combination_matrix(self):
-        combos = []
-        for s_idx in range(self.n_strats):
-            max_th = self.n_ths if s_idx < 6 else min(5, self.n_ths)
-            for th_idx in range(max_th):
-                combos.append((s_idx, th_idx))
-        return combos
+        if title is None:
+            title = f"Equity Curve - {self.ticker} - DC Ensemble Strategy"
 
-    def reset_trackers(self):
-        self.trackers = {th: DCTracker(th) for th in self.thresholds}
+        self.backtester.plot_equity(
+            title=title,
+            figsize=figsize,
+            show_buy_and_hold=show_buy_and_hold
+            )
 
-    def _precompute_states(self) -> None:
-        self.states_list = [None] * len(self.thresholds)
+    def train(
+        self,
+        method: str = 'GA',
+        pop_size: int = 100,
+        n_gen: int = 80,
+        **kwargs
+    ):
+        """
+        Train the model using GA or PSO.
+        """
+        from trainer import GATrainer, PSOTrainer
 
-        for th_idx, th in enumerate(self.thresholds):
-            tracker = DCTracker(th)  # Tracker independiente para precompute en training
+        print(f"Starting training with {method}...")
 
-            # Estadísticas
-            osv_list: List[float] = []
-            tmv_list: List[float] = []
-            
-            os_days_mask: List[bool] = []
-            uptrend_mask: List[bool] = []
+        if method.upper() == 'GA':
+            trainer = GATrainer(
+                model=self.model,
+                extractor=self.extractor,
+                backtester_class=DCBacktester,
+                prices=self.prices,
+                buy_cost=self.buy_cost,
+                sell_cost=self.sell_cost,
+                pop_size=pop_size,
+                n_gen=n_gen,
+                **kwargs
+            )
+        elif method.upper() == 'PSO':
+            trainer = PSOTrainer(
+                model=self.model,
+                extractor=self.extractor,
+                backtester_class=DCBacktester,
+                prices=self.prices,
+                buy_cost=self.buy_cost,
+                sell_cost=self.sell_cost,
+                swarm_size=pop_size,
+                n_gen=n_gen,
+                **kwargs
+            )
+        else:
+            raise ValueError("method must be 'GA' o 'PSO'")
 
-            # Procesar todos los precios para poblar listas históricas
-            for t_current, p_current in enumerate(self.prices):
-                tracker.update(t_current=t_current, p_current=p_current)
-                
-                # Guardar OSV y TMV histórico
-                osv_list.append(tracker.osv)
-                tmv_list.append(tracker.tmv)
-            
-                if tracker.is_dcc:
-                    os_days_mask.extend([True] * tracker.os_length_old) 
-                    os_days_mask.extend([False] * tracker.dc_duration) 
-            
-                uptrend_mask.append(tracker.trend == 'uptrend')
-            
-            last_os_days = len(uptrend_mask) - len(os_days_mask)
-            os_days_mask.extend([True] * last_os_days) 
+        trainer.train()
 
-            osv_array = np.array(osv_list)
-            tmv_array = np.array(tmv_list)
-            uptrend_array = np.array(uptrend_mask)
-            os_days_array = np.array(os_days_mask)
-            
-            os_mask = {'downtrend': os_days_array & ~uptrend_array,     # os and not uptrend
-                       'uptrend': os_days_array & uptrend_array         # os and uptrend
-                       }
-            
-            osv_dict = {}
-            tmv_dict = {}
-            osv_quart_med = {}
-            tmv_quart_med = {}
-            osv_best = {}
-            tmv_best = {}
-            for trend, mask in os_mask.items():
-                osv_dict[trend] = osv_array[mask]
-                tmv_dict[trend] = tmv_array[mask]
-            
-                osv_quart_med[trend] = medians_of_quartiles(osv_dict[trend])
-                tmv_quart_med[trend] = medians_of_quartiles(tmv_dict[trend])
+        # Update weights in the model after training
+        print("Training completed. Optimal weights assigned to the model.")
 
-            osv_best = find_best_candidates(th, osv_quart_med, self.prices, 'osv')
-            tmv_best = find_best_candidates(th, tmv_quart_med, self.prices, 'tmv')          
+        # Backtest with best model
+        self.backtest()
 
-            # rd y rn: ratios históricos promedio
-            rd = tracker.total_t_os / tracker.total_t_dc if tracker.total_t_dc > 0 else 1
-            rn = tracker.n_os / tracker.n_dc  if tracker.n_dc > 0 else 1
+    def save_model(self, filepath: str = None):
+        """Save optimized model weights to file"""
 
-            # Crear estado simple
-            state = type('State', (), {})()
-            state.osv_best_dt = osv_best['downtrend']
-            state.osv_best_ut = osv_best['uptrend']
-            state.tmv_best_dt = tmv_best['downtrend']
-            state.tmv_best_ut = tmv_best['uptrend']
-            state.rd = rd
-            state.rn = rn
+        if not filepath:
+            filepath = f'../persistency/{self.ticker}_model.pkl'
 
-            self.states_list[th_idx] = state
+        save_data = {
+            'model_weights': self.model.weights,
+            'combination_matrix': self.model.combination_matrix,
+            'best_cand_list': self.extractor.best_cand_list,
+            'n_strats': self.model.n_strats,
+            'n_ths': self.model.n_ths,
+            'thresholds': self.extractor.thresholds,
+            'strategy_names': [s.__name__ for s in self.extractor.strategies],
+            }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(save_data, f)
 
-    def fit(self, 
-            pop_size = 150,
-            n_gen = 50,
-            cxpb = 0.95,
-            mutpb = 0.05,
-            indpb = 0.1,
-            tournsize = 2,
-            save: bool = True):
+        print(f"Model saved to {filepath}")
 
-        ga_trainer = GATrainer(
-            self,
-            pop_size=pop_size,
-            n_gen=n_gen,
-            cxpb=cxpb,
-            mutpb = mutpb,
-            indpb = indpb,
-            tournsize = tournsize,
+    def load_model(self, filepath: str = None):
+        """Load model weights from file"""
+        
+        if not filepath:
+            filepath = f'../persistency/{self.ticker}_model.pkl'
+        
+        with open(filepath, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.model = DCEnsembleModel(
+            n_strats=data['n_strats'],
+            n_ths=data['n_ths'],
+            combination_matrix=data['combination_matrix']
             )
         
-        ga_trainer.train()
+        self.model.weights = data['model_weights']
 
-        if save:
-            self.save_model()
+        # Inyectar states fijos en el extractor existente
+        self.extractor.best_cand_list = data['best_cand_list']
 
-    def save_model(self, path: str = None) -> None:
-        """
-        """
+        # Opcional: re-precomputar señales con states fijos (por si cambiaste datos)
+        print("Recomputing signals with fixed trained states...")
+        self.extractor._precompute_signals()
 
-        if not path:
-            path = f'../persistency/{self.ticker}_model.pkl'
-            
-        if self.weights is None:
-            raise ValueError("No hay pesos entrenados para guardar. Ejecuta un entrenamiento primero.")
+        print(f"Full model loaded from {filepath}")
+        self.backtest()
 
-        states_serializable = {}
-        if self.states:
-            for th, state_obj in self.states.items():
-                states_serializable[float(th)] = state_obj.__dict__.copy()  # Dict plano: osv_best_dt, osv_best_ut, etc.
-
-        model_data = {
-            'weights': self.weights.tolist() if isinstance(self.weights, np.ndarray) else self.weights,  # List o lo que sea
-            'thresholds': self.thresholds,  # List[float]
-            'states': states_serializable,  # Dict[float, Dict[str, float]]
-            'strategies': [strat.__name__ for strat in self.strategies],
-            'combination_matrix': [list(combo) for combo in self.combination_matrix],
-        }
-
-        # Crear directorio si no existe
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-
-        with open(path, 'wb') as f:
-            pickle.dump(model_data, f)
-
-        print(f"Modelo guardado correctamente en: {path}")
-        
-
-    def load_model(self, path: str = None):
-        if not path:
-            path = f'../persistency/{self.ticker}_model.pkl'
-
-        with open(path, 'rb') as f:
-            model_data = pickle.load(f)
-
-        loaded_weights = model_data['weights']
-        self.weights = np.array(loaded_weights) if isinstance(loaded_weights, list) else loaded_weights
-        
-        # Reconstrucción de states (objeto dinámico como usás)
-        self.states = {}
-        if model_data.get('states'):
-            for th, state_dict in model_data['states'].items():
-                state = type('State', (), {})()  # Tu técnica dinámica
-                state.__dict__.update(state_dict)
-                self.states[float(th)] = state
-        
-        # Thresholds y combination_matrix
-        self.thresholds = model_data['thresholds']
-        if 'combination_matrix' in model_data:
-            self.combination_matrix = [tuple(combo) for combo in model_data['combination_matrix']]
-
-    def _copy_state(self, base_state: Any) -> Any:
-        if base_state is None:
-            return type('State', (), {})()
-        new_state = type('State', (), {})()
-        for attr in dir(base_state):
-            if not attr.startswith('_') and not callable(getattr(base_state, attr)):
-                setattr(new_state, attr, getattr(base_state, attr))
-        return new_state
-
-    def predict(self, t_current: int, p_current: float, weights: np.ndarray= None, reset_tracker: bool = False) -> int:
-        """
-        Genera recomendación ensemble.
-        - Si al menos 2 sub-estrategias votan non-hold → se ignora hold y se decide entre buy/sell.
-        - Si menos de 2 votos non-hold → soft-voting normal (hold puede ganar).
-        """
-
-        if weights is None:
-            weights = self.weights
-        if weights is None:
-            raise ValueError("Weights not set; run fit or load_model first")
-
-        if reset_tracker:
-            self.reset_trackers()
-
-        # Update trackers live
-        for tracker in self.trackers.values():
-            tracker.update(t_current=t_current, p_current=p_current)
-
-        buy_weight = sell_weight = hold_weight = 0.0
-        num_non_hold = 0  # Contador de votos buy o sell
-        # print(f'time: {t_current}')
-        for strat_idx, theta_idx in self.combination_matrix:
-            w = weights[strat_idx, theta_idx]
-            if w == 0.0:
-                continue
-
-            theta = self.thresholds[theta_idx]
-            tracker = self.trackers[theta]
-
-            # Acceso a state precomputado por índice (robusto)
-            if self.states_list is None or len(self.states_list) <= theta_idx:
-                base_state = None
-            else:
-                base_state = self.states_list[theta_idx]
-
-            if base_state is None:
-                class DummyState:
-                    osv_best_dt = osv_best_ut = tmv_best_dt = tmv_best_ut = 1.0
-                    rd = 2.0
-                    rn = 0.5
-                base_state = DummyState()
-
-            state = type('State', (), {k: v for k, v in base_state.__dict__.items()})()
-
-            state.trend = tracker.trend
-            state.p_ext = tracker.p_ext
-            state.p_ext_initial = tracker.p_ext_initial
-            state.p_dcc_star = tracker.p_dcc_star
-            state.dc_duration = tracker.dc_duration
-            state.t_dcc = tracker.t_dcc
-            state.is_dcc = tracker.is_dcc
-            state.trend_history = tracker.trend_history.copy()
-            state.if_os = tracker.if_os.copy()
-            state.theta = theta
-
-            if state.trend == 'downtrend':
-                state.osv_best = base_state.osv_best_dt
-                state.tmv_best = base_state.tmv_best_dt
-            else:
-                state.osv_best = base_state.osv_best_ut
-                state.tmv_best = base_state.tmv_best_ut
-
-            strat = self.strategies[strat_idx](t_current, p_current, self.position, state)
-            rec = strat.recommendation
-
-            if rec == 1:        # buy
-                buy_weight += w
-                num_non_hold += 1
-            elif rec == 2:      # sell
-                sell_weight += w
-                num_non_hold += 1
-            else:               # hold
-                hold_weight += w
-
-            # print(f'recommendation: {rec}')
-            # print(f'buy: {buy_weight}')
-            # print(f'sell: {sell_weight}')
-            # print(f'hold: {hold_weight}')
-
-
-        # Al menos 2 votos non-hold → ignorar hold
-        if num_non_hold >= 2:
-            hold_weight = 0.0
-
-        # print('total recommendations')
-        # print(f'buy: {buy_weight}')
-        # print(f'sell: {sell_weight}')
-        # print(f'hold: {hold_weight}')
-
-        # print(f'non hold: {num_non_hold}')
-
-        total = buy_weight + sell_weight + hold_weight
-        if total == 0:
-            return 0  # hold seguro
-
-        # print('total recommendations normalized')
-        # print(f'buy: {buy_weight/ total}')
-        # print(f'sell: {sell_weight/ total}')
-        # print(f'hold: {hold_weight/ total}')
-
-        # print(f'recomendation: {int(np.argmax([hold_weight / total, buy_weight / total, sell_weight / total]))}')
-        # print('')
-        
-
-        probs = [hold_weight / total, buy_weight / total, sell_weight / total]
-        return int(np.argmax(probs))
-
-
-    def predict_single(self, t_current: int, p_current: float, strategy_idx: int, threshold_idx: int) -> int:
-        if strategy_idx < 0 or strategy_idx >= self.n_strats:
-            raise ValueError(f"strategy_idx must be between 0 and {self.n_strats - 1}")
-        if threshold_idx < 0 or threshold_idx >= self.n_ths:
-            raise ValueError(f"threshold_idx must be between 0 and {self.n_ths - 1}")
-
-        theta = self.thresholds[threshold_idx]
-        tracker = self.trackers[theta]
-        tracker.update(t_current, p_current)
-
-        base_state = self.states.get(theta) if self.states else None
-        state = self._copy_state(base_state)
-
-        state.trend = tracker.trend
-        state.p_ext = tracker.p_ext
-        state.p_ext_initial = tracker.p_ext_initial
-        state.p_dcc_star = tracker.p_dcc_star
-        state.dc_duration = tracker.dc_duration
-        state.t_dcc = tracker.t_dcc
-        state.is_dcc = tracker.is_dcc
-        state.trend_history = tracker.trend_history.copy()
-        state.if_os = tracker.if_os.copy()
-        state.theta = theta
-
-        # Asignación dinámica según tendencia actual
-        if state.trend == 'downtrend':
-            state.osv_best = getattr(state, 'osv_best_dt', 1.0)
-            state.tmv_best = getattr(state, 'tmv_best_dt', 1.0)
-        else:
-            state.osv_best = getattr(state, 'osv_best_ut', 1.0)
-            state.tmv_best = getattr(state, 'tmv_best_ut', 1.0)
-
-        strat = self.strategies[strategy_idx](t_current, p_current, self.position, state)
-        return strat.recommendation
-
-    def backtest(self, weights = None) -> Dict[str, Any]:
-        if weights is None:
-            weights = self.weights
-        if weights is None:
-            raise ValueError("Weights not set; run fit or load_model first")
-        
-        self.position = False
-        buy_price = 0.0
-        returns = []
-        trades = 0
-
-        self.reset_trackers()
-        
-        for t_current, p_current in enumerate(self.prices):
-
-            # print("")
-            # print(f'current price: {p_current}')
-            # print(f'current time: {t_current}')
-            action = self.predict(t_current, p_current, weights)
-            # print(action)
-            if action == 0:
-                continue
-            if action == 1 and not self.position:
-                buy_price = p_current * self.buy_cost_factor 
-                self.position = True
-            elif action == 2 and self.position:
-                sell_price = p_current * self.sell_cost_factor
-                ret = (sell_price - buy_price) / buy_price
-                returns.append(ret)
-                self.position = False
-                trades += 1
-        if self.position:
-            sell_price = self.prices.iloc[-1] * self.sell_cost_factor
-            ret = (sell_price - buy_price) / buy_price
-            returns.append(ret)
-            trades += 1
-        if not returns:
-            returns = [0]
-        
-        # compute metrics
-        mean_r = np.mean(returns)
-        std_r = np.std(returns)
-        ror = np.prod(1 + np.array(returns)) - 1
-        sr = mean_r / std_r if std_r > 0 else 0
-        var = np.percentile(returns, 5)
-        tor = trades / len(self.prices) if len(self.prices) > 0 else 0
-
-        return {'RoR': ror, 'STD': std_r, 'SR': sr, 'VaR': var, 'ToR': tor, 'returns': returns, 'trades': trades}
-    
-    def backtest3(self, weights=None) -> Dict[str, Any]:
-        """
-        Backtest que registra la evolución del cumulative return con fecha correspondiente.
-        Mantiene la lógica de trading del backtest original (señales 0=hold, 1=buy, 2=sell).
-        """
-        if weights is None:
-            weights = self.weights
-        if weights is None:
-            raise ValueError("Weights not set; run fit or load_model first")
-        
-        # Inicialización
-        self.position = False          # ¿Hay posición abierta?
-        buy_price = 0.0                # Precio de entrada (con coste de compra)
-        equity = 1.0                   # Capital inicial normalizado a 1 (retorno compuesto)
-        cumulative = []                # Lista para guardar (date, cumulative_return)
-        
-        # Índices de fechas (asumiendo self.prices es pd.Series con index datetime)
-        if isinstance(self.prices, pd.Series):
-            dates = self.prices.index
-        else:
-            dates = range(len(self.prices))  # fallback si es list/array
-        
-        # Recorrido por cada punto temporal
-        for t_current, p_current in enumerate(self.prices):
-            action = self.predict(t_current, p_current, weights)
-            
-            # Ejecutar venta si hay señal de sell y posición abierta
-            if action == 2 and self.position:
-                sell_price = p_current * self.sell_cost_factor
-                ret = (sell_price - buy_price) / buy_price
-                equity *= (1 + ret)        # Aplicar retorno al capital compuesto
-                self.position = False
-            
-            # Ejecutar compra si hay señal de buy y no hay posición
-            if action == 1 and not self.position:
-                buy_price = p_current * self.buy_cost_factor
-                self.position = True
-            
-            # Guardar el cumulative return AL FINAL del período actual
-            current_date = dates[t_current] if hasattr(dates, '__getitem__') else t_current
-            cumulative.append((current_date, equity - 1))  # RoR acumulado hasta este punto
-        
-        # Cerrar posición abierta al final del backtest (último precio)
-        if self.position:
-            sell_price = self.prices.iloc[-1] * self.sell_cost_factor
-            ret = (sell_price - buy_price) / buy_price
-            equity *= (1 + ret)
-            # Actualizamos el último registro con el cierre final
-            cumulative[-1] = (cumulative[-1][0], equity - 1)
-        
-        # Convertir a DataFrame para mayor comodidad
-        cum_df = pd.DataFrame(cumulative, columns=['date', 'cumulative_return'])
-        cum_df.set_index('date', inplace=True)
-        
-        # Métricas adicionales (compatibles con el backtest original)
-        final_ror = equity - 1
-        trades = self.backtest(weights)['trades'] if hasattr(self, 'backtest') else None  # opcional
-        
+    def summary(self) -> Dict[str, Any]:
+        """Current state summary"""
         return {
-            'final_RoR': final_ror,
-            'cumulative_series': cum_df,          # Serie temporal principal (pd.DataFrame)
-            'equity_curve': cum_df['cumulative_return'] + 1,  # Equity normalizada (útil para plots)
-            'trades': trades
-        }
-    
-class Backtest:
-    def __init__(self, trader: DCTrader):
-        self.trader = trader
-        self.prices = trader.prices
-        self.dates = trader.dates
-        self.n_days = len(self.prices)
-
-    def run_ensemble(self) -> Dict[str, Any]:
-        """Ejecuta backtest del modelo MSTGAM (ensemble optimizado por GA)"""
-        return self.trader.backtest()
-
-    def run_buy_hold(self) -> Dict[str, Any]:
-        """Buy & Hold con costos de transacción (una compra al inicio, una venta al final)"""
-        if self.n_days < 2:
-            return {'RoR': 0.0, 'STD': 0.0, 'SR': 0.0, 'VaR': 0.0, 'ToR': 0.0, 'trades': 0}
-
-        buy_price = self.prices.iloc[0] * self.trader.buy_cost_factor
-        sell_price = self.prices.iloc[-1] * self.trader.sell_cost_factor
-        ret = (sell_price - buy_price) / buy_price
-
-        returns = [ret]  # Un solo retorno compuesto
-        mean_r = ret
-        std_r = 0.0  # Buy & Hold tiene un solo retorno → STD = 0
-        sr = 0.0     # Por convención en el paper, SR = 0 cuando STD = 0
-        var = ret    # Peor caso es el único retorno
-        tor = 2 / self.n_days  # Dos operaciones (buy + sell)
-
-        return {
-            'RoR': ret,
-            'STD': std_r,
-            'SR': sr,
-            'VaR': var,
-            'ToR': tor,
-            'returns': returns,
-            'trades': 1  # Una operación completa
-        }
-
-    def run_single_strategy(self, strategy_idx: int, threshold_idx: int) -> Dict[str, Any]:
-        """Backtest de una estrategia individual (una de las 8 x un threshold específico)"""
-        if strategy_idx < 0 or strategy_idx >= self.trader.n_strats:
-            raise ValueError(f"strategy_idx debe estar entre 0 y {self.trader.n_strats - 1}")
-        if threshold_idx < 0 or threshold_idx >= self.trader.n_ths:
-            raise ValueError(f"threshold_idx debe estar entre 0 y {self.trader.n_ths - 1}")
-
-        theta = self.trader.thresholds[threshold_idx]
-        tracker = DCTracker(theta)  # Tracker independiente y limpio
-
-        position = False
-        buy_price = 0.0
-        returns = []
-        trades = 0
-
-        # Reset explícito
-        tracker = DCTracker(theta)
-
-        for t_current, p_current in enumerate(self.prices):
-            tracker.update(t_current=t_current, p_current=p_current)
-            action = self.trader.predict_single(t_current, p_current, strategy_idx, threshold_idx)
-
-            if action == 1 and not position:  # Buy
-                buy_price = p_current * self.trader.buy_cost_factor
-                position = True
-            elif action == 2 and position:  # Sell
-                sell_price = p_current * self.trader.sell_cost_factor
-                ret = (sell_price - buy_price) / buy_price
-                returns.append(ret)
-                position = False
-                trades += 1
-
-        # Cerrar posición abierta al final
-        if position:
-            sell_price = self.prices.iloc[-1] * self.trader.sell_cost_factor
-            ret = (sell_price - buy_price) / buy_price
-            returns.append(ret)
-            trades += 1
-
-        if not returns:
-            returns = [0.0]
-            ror = 0.0
-            mean_r = 0.0
-            std_r = 0.0
-            sr = 0.0
-            var = 0.0
-        else:
-            ror = np.prod(1 + np.array(returns)) - 1
-            mean_r = np.mean(returns)
-            std_r = np.std(returns)
-            sr = mean_r / std_r if std_r > 0 else 0.0
-            var = np.percentile(returns, 5)  # VaR al 5% (peor 5% de retornos)
-
-        tor = trades / self.n_days if self.n_days > 0 else 0.0
-
-        return {
-            'RoR': ror,
-            'STD': std_r,
-            'SR': sr,
-            'VaR': var,
-            'ToR': tor,
-            'returns': returns,
-            'trades': trades
-        }
-
-    def compare_metrics(self, strategies: List[Union[str, Tuple[int, int]]] = None) -> pd.DataFrame:
-        """
-        Compara métricas clave como en Tabla 3 del paper.
-        strategies: ['MSTGAM', 'buy_hold'] o tuplas (strategy_idx, threshold_idx)
-        """
-        if strategies is None:
-            strategies = ['MSTGAM', 'buy_hold']
-
-        results = {}
-
-        for strat in strategies:
-            if strat == 'MSTGAM':
-                name = 'MSTGAM'
-                metrics = self.run_ensemble()
-            elif strat == 'buy_hold':
-                name = 'Buy & Hold'
-                metrics = self.run_buy_hold()
-            elif isinstance(strat, tuple) and len(strat) == 2:
-                s_idx, th_idx = strat
-                theta_val = self.trader.thresholds[th_idx]
-                name = f'S{s_idx + 1}-θ{th_idx}'  # Ej: S1-θ3 → Estrategia 1 con threshold índice 3
-                metrics = self.run_single_strategy(s_idx, th_idx)
-            else:
-                raise ValueError(f"Estrategia no válida: {strat}")
-
-            results[name] = {
-                'RoR': round(metrics['RoR'], 4),
-                'STD': round(metrics['STD'], 4),
-                'SR': round(metrics['SR'], 4),
-                'VaR': round(metrics['VaR'], 4),
-                'ToR': round(metrics['ToR'], 4),
-                'Trades': metrics['trades']
+            'ticker': self.ticker,
+            'period': f"{self.dates.iloc[0].date()} → {self.dates.iloc[-1].date()}",
+            'n_days': len(self.stock.data),
+            'n_strategies': self.extractor.n_strats,
+            'n_thresholds': self.extractor.n_ths,
+            'n_trainable_weights': self.model.n_weights,
+            'last_backtest': self.last_results if self.last_results else "No backtest run yet",
+            'extractor_summary': self.extractor.summary(),
+            'model_summary': self.model.summary()
             }
+    
+    def get_latest_recommendation(self) -> str:
+        """Return recommendation for the last available day"""
+        if self.extractor.n_days == 0:
+            raise ValueError("No enough data to extract signals.")
+        
+        recommendation = {}
+        last_date = self.dates.iloc[-1].date()
+        for pos in [False, True]:
+            signals_last_day = self.extractor.signals[pos][-1]
+            
+            code = self.model.predict_day(signals_last_day)
+            actions = {0: 'hold', 1: 'buy', 2: 'sell'}
+            recommendation[pos] = actions[code]
 
-        df = pd.DataFrame(results).T
-        df = df[['RoR', 'STD', 'SR', 'VaR', 'ToR', 'Trades']]
-        return df
-
-    def plot_equity_curves(self, strategies: List[Union[str, Tuple[int, int]]] = None, figsize=(14, 8)):
-        """
-        Grafica curvas de equity (retorno acumulado vs tiempo físico)
-        """
-        if strategies is None:
-            strategies = ['MSTGAM', 'buy_hold']
-
-        plt.figure(figsize=figsize)
-        dates = self.dates
-
-        for strat in strategies:
-            if strat == 'MSTGAM':
-                name = 'MSTGAM (GA Optimized)'
-                metrics = self.run_ensemble()
-            elif strat == 'buy_hold':
-                name = 'Buy & Hold'
-                # Equity lineal desde inicio hasta final
-                initial = self.prices.iloc[0] * self.trader.buy_cost_factor
-                final = self.prices.iloc[-1] * self.trader.sell_cost_factor
-                equity = np.linspace(0, (final - initial) / initial, self.n_days)
-                plt.plot(dates, equity, label=name, linewidth=2)
-                continue
-            elif isinstance(strat, tuple):
-                s_idx, th_idx = strat
-                theta_val = self.trader.thresholds[th_idx]
-                name = f'S{s_idx + 1}-θ{th_idx}'
-                metrics = self.run_single_strategy(s_idx, th_idx)
-            else:
-                raise ValueError(f"Estrategia no válida: {strat}")
-
-            returns = metrics['returns']
-            # Construir equity curve diaria
-            equity = [0.0]
-            for ret in returns:
-                equity.append(equity[-1] + ret)  # Suma simple (compounding implícito en retornos)
-            # Expandir para todos los días (mantener último valor hasta próximo trade)
-            full_equity = []
-            trade_idx = 0
-            for i in range(self.n_days):
-                if trade_idx < len(equity) - 1 and i >= trade_idx * (self.n_days // max(len(returns), 1)):
-                    trade_idx += 1
-                full_equity.append(equity[min(trade_idx, len(equity) - 1)])
-
-            plt.plot(dates, full_equity, label=name)
-
-        plt.title('Curvas de Equity - Comparación de Estrategias')
-        plt.xlabel('Fecha')
-        plt.ylabel('Retorno Acumulado')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
+            print(f"Recommention for {last_date}: \033[1m{recommendation[pos].upper()}\033[0m if position={pos}")

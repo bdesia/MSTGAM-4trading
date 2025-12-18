@@ -1,4 +1,5 @@
 import random
+random.seed(42)
 
 class StrategyBase:
     def __init__(self, t_current, p_current, position, state):
